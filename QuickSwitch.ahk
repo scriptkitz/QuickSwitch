@@ -217,6 +217,9 @@ ExitApp
 
 		If ( A_LoopField = "Edit1"   ) 
 			_Edit1 := 1
+		; RTX Window
+		If ( A_LoopField = "RichEdit20W1" )
+			_RichEdit20W1 := 1
 	}
 
 
@@ -225,7 +228,7 @@ ExitApp
 		Return "GENERAL"
 
 	}
-	Else If ( _SysListView321 and _ToolbarWindow321 and _Edit1 ) 
+	Else If ( _SysListView321 and _ToolbarWindow321 and _Edit1 and not _RichEdit20W1 ) 
 	{
 		Return "SYSLISTVIEW"
 	}
