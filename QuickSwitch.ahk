@@ -441,7 +441,7 @@ Return
 		WinGetClass, _thisClass, ahk_id %_thisID%
 
 	;---------------[ Total Commander Folders]--------------------------------------
-
+	
 		If ( _thisClass = "TTOTAL_CMD")
 		{
 		;	Get Process information for TC icon
@@ -929,7 +929,7 @@ Return
 	$next := this_z + _zDelta
 	next_id := id%$next%
 	WinGetClass, next_class, ahk_id %next_id%
-
+	
 
 	If ( next_class = "TTOTAL_CMD" ) 							;	Total Commander
 	{
@@ -982,7 +982,26 @@ Return
 			}
 		}
 	}
-
+	
+	If ( next_class = "TablacusExplorer")
+	{
+		For $Exp in ComObjCreate("Shell.Application").Windows
+		{
+			StringRight, checkver, % $Exp.FullName, 8
+			if checkver contains TE32.exe,TE64.exe
+			{
+				if ($Exp.Document.parentWindow)
+				{
+					$Exp.Document.parentWindow.execScript("document.tophwnd = GetTopWindow(WebBrowser.hwnd)")
+					if ( next_id = $Exp.Document.tophwnd )
+					{
+						$ZFolder := $Exp.Document.F.addressbar.value
+						Break
+					}
+				}
+			}
+		}
+	}
 
 	If ( next_class = "dopus.lister" )							;	Directory Opus
 	{
