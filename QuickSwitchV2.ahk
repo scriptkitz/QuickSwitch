@@ -1,6 +1,9 @@
 ﻿#Requires AutoHotkey >=2.0
 #Singleinstance Force
 
+#Include "Sqlite.ahk"
+
+
 SetWorkingDir(A_ScriptDir)
 
 If (VerCompare(A_OSVersion, "10.0.0") <= 0) {
@@ -8,6 +11,7 @@ If (VerCompare(A_OSVersion, "10.0.0") <= 0) {
 	ExitApp
 }
 
+SqlObj := SQliteDB("Sqlite/Sqlite3.dll")
 
 Hotkey("^W", ShowMenu, "Off")
 
@@ -19,7 +23,10 @@ Loop {
 		windows_title := WinGetTitle(WinID)
 		windows_exe := WinGetProcessName(WinID)
 		FingerPrint := windows_exe . "___" . windows_title
-
+		DialogNodeID := SqlObj.GetDialogNodeID(FingerPrint)
+		if (!DialogNodeID) {
+			SqlObj.AddDialogNode(FingerPrint)
+		}
 		FolderPath := GetZWindowPath(WinID)
 		if (ValidFolder(FolderPath)) {
 			; MsgBox(FDType)
@@ -53,18 +60,36 @@ ValidFolder(_path_) {
 
 ; 获取下一个主窗口包含的文件夹路径
 GetZWindowPath(WinID) {
-	_zDelta := 2 
-	; 一般情况弹出对话框的下一层是主窗口，主窗口的下一个窗口就是我们要找的窗口
-	; 所以窗口顺序就是当前对话框+1为主窗口，再+1就是下一个窗口，所以这里默认是2
-	WinIDs := WinGetList()
-	found_idx := -1
 	ZFolder := ""
-	Loop WinIDs.Length {
-		if (WinIDs[A_Index] = WinID) {
-			found_idx := A_Index
+	_GetNextWinID1(WinID) {
+		WinIDs := WinGetList()
+		_zDelta := 2 
+		; 一般情况弹出对话框的下一层是主窗口，主窗口的下一个窗口就是我们要找的窗口
+		; 所以窗口顺序就是当前对话框+1为主窗口，再+1就是下一个窗口，所以这里默认是2
+		found_idx := -1
+		Loop WinIDs.Length {
+			if (WinIDs[A_Index] = WinID) {
+				found_idx := A_Index
+			}
 		}
+		return WinIDs[found_idx + _zDelta]
 	}
-	nextWinID := WinIDs[found_idx + _zDelta]
+	_GetNextWinID2(WinID) {
+		WinIDs := WinGetList()
+		GA_PARENT := 1
+		GA_ROOT := 2
+		GA_ROOTOWNER := 3
+		root := DllCall("GetAncestor", "Ptr", WinID, "Uint", GA_ROOTOWNER)
+		found_idx := -1
+		Loop WinIDs.Length {
+			if (WinIDs[A_Index] = root) {
+				found_idx := A_Index
+			}
+		}
+		return WinIDs[found_idx + 1]
+	}
+
+	nextWinID := _GetNextWinID2(WinID)
 	found_class := WinGetClass(nextWinID)
 	Switch found_class, True {
 		Case "TTOTAL_CMD": ;	Total Commander
@@ -72,10 +97,10 @@ GetZWindowPath(WinID) {
 		Case "CabinetWClass": ;	File Explorer
 			For (ComWin in ComObject("Shell.Application").Windows)
 			{
+				_checkID := 0
 				Try {
 					_checkID := ComWin.hwnd
 				} catch Error as err {
-
 				}
 				if (nextWinID = _checkID) {
 					ZFolder := ComWin.Document.Folder.Self.Path
