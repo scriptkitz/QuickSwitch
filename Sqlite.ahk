@@ -1,7 +1,7 @@
 CreateTableSQL := "BEGIN TRANSACTION;" .
-'CREATE TABLE IF NOT EXISTS config (ID INTEGER PRIMARY KEY AUTOINCREMENT, "Key" TEXT UNIQUE NOT NULL, Value TEXT);' .
-'CREATE TABLE IF NOT EXISTS dialog (ID INTEGER PRIMARY KEY AUTOINCREMENT, dialog TEXT UNIQUE NOT NULL);' .
-'CREATE TABLE IF NOT EXISTS dialog_paths (ID INTEGER PRIMARY KEY AUTOINCREMENT, dialog_id INTEGER REFERENCES dialog (ID), path TEXT);' .
+"CREATE TABLE IF NOT EXISTS config (ID INTEGER PRIMARY KEY AUTOINCREMENT, 'Key' TEXT UNIQUE NOT NULL, Value TEXT);" .
+"CREATE TABLE IF NOT EXISTS dialog (ID INTEGER PRIMARY KEY AUTOINCREMENT, dialog TEXT UNIQUE NOT NULL);" .
+"CREATE TABLE IF NOT EXISTS dialog_paths (ID INTEGER PRIMARY KEY AUTOINCREMENT, dialog_id INTEGER REFERENCES dialog (ID), path TEXT);" .
 "COMMIT TRANSACTION;"
 
 Class SQliteDB {
@@ -41,9 +41,18 @@ Class SQliteDB {
         StrPut(Str, _buf, "UTF-8")
         return _buf
     }
-   _UTF8BufferToStr(UTF8) {
-      Return StrGet(UTF8, "UTF-8")
-   }
+    _UTF8BufferToStr(UTF8) {
+        Return StrGet(UTF8, "UTF-8")
+    }
+    _EscapeStr(Str, Quote := True) {
+        _buf := this._StrToUTF8Buffer(Str)
+        _fbuf := Buffer(3)
+        StrPut(Quote ? "%Q" : "%q", _fbuf, "UTF-8")
+        Ptr := DllCall("SQLite3.dll\sqlite3_mprintf", "Ptr", _fbuf, "Ptr", _buf, "Cdecl UPtr")
+        rStr := this._UTF8BufferToStr(Ptr)
+        DllCall("SQLite3.dll\sqlite3_free", "Ptr", Ptr, "Cdecl")
+        return rStr
+    }
     OpenDB(db_path) {
         Static SQLITE_OPEN_READONLY  := 0x01 ; Database opened as read-only
         Static SQLITE_OPEN_READWRITE := 0x02 ; Database opened as read-write
@@ -70,6 +79,7 @@ Class SQliteDB {
             return False
         }
         this._DBHandle := HDB
+        this.Exec(CreateTableSQL)
         return True
     }
     CloseDB() {
@@ -103,14 +113,17 @@ Class SQliteDB {
         return True
     }
 
-
     AddDialogNode(value) {
         _cb(ud, colCount, colValues, colNames) {
             if (colCount > 0)
                 _id := StrGet(NumGet(colValues, "UInt"), "UTF-8")
         }
-        SQL := Format("INSERT INTO dialog (dialog) VALUES ('{}');", value)
-        return this.Exec(SQL, _cb)
+        ev := this._EscapeStr(value)
+        SQL := Format("INSERT INTO dialog (dialog) VALUES ({});", ev)
+        if (this.Exec(SQL, _cb)) {
+            return this.GetDialogNodeID(value)
+        }
+        return ""
     }
     GetDialogNodeID(value) {
         _id := ""
