@@ -3,6 +3,8 @@
 
 #Include "Sqlite.ahk"
 
+SetWinDelay -1
+SetControlDelay -1
 
 SetWorkingDir(A_ScriptDir)
 
@@ -15,21 +17,38 @@ G_IniConfig := IniConfig("config.ini")
 
 Hotkey("^W", ShowMenu, "Off")
 
+SWP_NOSIZE := 0x1
+SWP_NOACTIVATE := 0x10
+SWP_DRAWFRAME  := 0x20
+SWP_SHOWWINDOW := 0x40
+SWP_HIDEWINDOW := 0x80
+SWP_ASYNCWINDOWPOS := 0x4000
+
+WS_POPUP   := 0x80000000
+WS_CHILD   := 0x40000000
+WS_VISIBLE := 0x10000000
+
+WM_CHANGEUISTATE := 0x0127
+WM_UPDATEUISTATE := 0x0128
+
 G_DlgHwnd := 0
+G_LastSetDlg := 0 ; 最后一次自动切换路径的对话框
+G_Menu := Menu()
 G_ToolWnd := CreateToolWnd()
-_G_LastDlgWndRect := {x:0, y:0, w:0, h:0}
 _G_DialogFinger := ""
 _G_FDType := ""
-_G_DlgIsNotActive := True
 _G_bAutoSwitch := True
-
 
 Loop {
 	WinID := WinWaitActive("ahk_class #32770")
-	_G_DlgIsNotActive := False
 	_G_FDType := GetFileDialogType(WinID)
 	if (_G_FDType) {
 		G_DlgHwnd := WinID
+		UpToolWndParentAndPos(WinID)
+		; 激活的窗口在失去激活前只能自动设置一次路径。
+		if (G_LastSetDlg = G_DlgHwnd) { 
+			Continue
+		}
 		windows_title := WinGetTitle(WinID)
 		windows_exe := WinGetProcessName(WinID)
 		_G_DialogFinger := windows_exe . "___" . windows_title
@@ -47,81 +66,95 @@ Loop {
 		if (_G_bAutoSwitch && ValidFolder(FolderPath)) {
 			FeedDialog(WinID, FolderPath)
 		}
-			
-		SetTimer _UpToolWndPos, 10
+
 		WinWaitNotActive(WinID)
 		G_IniConfig.WriteDialogPaths(_G_DialogFinger, FolderPath)
-		_G_DlgIsNotActive := True
-		if (!WinActive(G_ToolWnd.Hwnd)) {
-			_G_LastDlgWndRect.x := 0
-			_G_LastDlgWndRect.y := 0
-			_G_LastDlgWndRect.w := 0
-			_G_LastDlgWndRect.h := 0
-			G_ToolWnd.Hide()
-		}
-		; Break
+		_HideToolWnd(0)
+		G_LastSetDlg := 0
 	}
 }
 ExitApp(0)
 
-_UpToolWndPos() {
-	global _G_LastDlgWndRect
-	if (_G_DlgIsNotActive)
-		return
-	bShow := WinActive(G_DlgHwnd)
-	If (bShow) {
-		WinGetPos &x, &y, &w, &h, WinID
-		if (_G_LastDlgWndRect.x != x || 
-			_G_LastDlgWndRect.y != y || 
-			_G_LastDlgWndRect.w != w || 
-			_G_LastDlgWndRect.h != h)
-		{
-			_G_LastDlgWndRect.x := x
-			_G_LastDlgWndRect.y := y
-			_G_LastDlgWndRect.w := w
-			_G_LastDlgWndRect.h := h
+_HideToolWnd(ParentWnd){
+	_style := WinGetStyle(G_ToolWnd.Hwnd)
+	_style := _style | WS_POPUP
+	_style := _style & ~WS_VISIBLE
+	WinSetStyle _style, G_ToolWnd.Hwnd
+	preWnd := DllCall("SetParent", "Ptr", G_ToolWnd.Hwnd, "Ptr", ParentWnd)
+	flag := SWP_HIDEWINDOW
+	DllCall("SetWindowPos", "Ptr", G_ToolWnd.Hwnd, "Ptr", 0, "Int", 0,"Int", 0, "Int", 50, "Int", 50, "UInt", flag, "Int")
+}
 
-			G_ToolWnd.Move(x+(w/2)-25, y)
-			G_ToolWnd.Show("NoActivate")
-		}
-	} else {
-		SetTimer ,0
+MAKELONG(LOWORD,HIWORD,Hex:=0){
+    BITS:=0x10,WORD:=0xFFFF
+    return (!Hex)?((HIWORD<<BITS)|(LOWORD&WORD)):Format("{1:#x}",((HIWORD<<BITS)|(LOWORD&WORD)))
+}
+
+_ShowToolWnd(ParentWnd){
+	_style := 0
+	_style := _style & ~WS_POPUP
+	_style := _style | WS_CHILD
+	_style := _style | WS_VISIBLE
+	WinSetStyle _style, G_ToolWnd.Hwnd
+	preWnd := DllCall("SetParent", "Ptr", G_ToolWnd.Hwnd, "Ptr", ParentWnd)
+}
+
+UpToolWndParentAndPos(_WinID) {
+	WinGetPos &x, &y, &w, &h, _WinID
+	WinGetPos &cx, &cy, &cw, &ch, G_ToolWnd.Hwnd
+	_parent := DllCall("GetParent", "Ptr", G_ToolWnd.Hwnd)
+	if (_parent != _WinID) {
+		_ShowToolWnd(_WinID)
 	}
+
+	flag := SWP_SHOWWINDOW|SWP_DRAWFRAME
+	; 这里的大小如果是50，50，则导致第一次显示正常，后面就显示不出来了，但可以点击到，不知道是否BUG，只好用100，100了
+	DllCall("SetWindowPos", "Ptr", G_ToolWnd.Hwnd, "Ptr", 0, "Int", 0,"Int", 0, "Int", 100, "Int", 100, "UInt", flag, "Int")
 }
 
 OnBtnSetting(Obj, info) {
 	AUTOSWITCH := "自动切换"
 	OnMenuPath(_name, _pos, _menu) {
 		if (AUTOSWITCH = _name) {
-			G_IniConfig.WriteDialogNode(_G_DialogFinger, !_G_bAutoSwitch)
 			_menu.ToggleCheck(_name)
+			G_IniConfig.WriteDialogNode(_G_DialogFinger, !_G_bAutoSwitch)
 		} else {
-			G_IniConfig.WriteDialogNode(_G_DialogFinger, False)
 			FeedDialog(G_DlgHwnd, _name)
 		}
 	}
 	MouseGetPos &x, &y
-	m := Menu()
-	m.Add(AUTOSWITCH, OnMenuPath)
-	_G_bAutoSwitch ? m.Check(AUTOSWITCH) : m.UnCheck(AUTOSWITCH)
+	G_Menu.Delete()
+	G_Menu.Add(AUTOSWITCH, OnMenuPath)
+	_G_bAutoSwitch ? G_Menu.Check(AUTOSWITCH) : G_Menu.UnCheck(AUTOSWITCH)
 	paths := G_IniConfig.ReadDialogPaths(_G_DialogFinger)
 
 	for idx, p in paths {
-		m.Add(p, OnMenuPath)
+		G_Menu.Add(p, OnMenuPath)
 	}
 	ControlGetPos &cx, &cy, &cw, &ch, Obj
-	m.Show(cx, cy+ch)
+
+	_parent := DllCall("GetParent", "Ptr", G_Menu.Handle)
+	if (_parent != G_ToolWnd.hwnd) {
+		_style := 0
+		_style := _style & ~WS_POPUP
+		_style := _style | WS_CHILD
+		_style := _style | WS_VISIBLE
+		WinSetStyle _style, G_ToolWnd.hwnd
+		DllCall("SetParent", "Ptr", G_Menu.Handle, "Ptr", G_ToolWnd.hwnd)
+	}
+	G_Menu.Show(cx, cy+ch)
 }
 
 CreateToolWnd() {
-	_gui := Gui("ToolWindow AlwaysOnTop -Sysmenu -Caption -Border -DPIScale")
+	_gui := Gui("")
+	_gui.MarginX := 0
+	_gui.MarginY := 0
 	_gui.BackColor := "Silver"
+	_gui.SetFont("s8")
 	WinSetTransColor "Silver", _gui
-	BtnSet := _gui.Add("Button", , "⚙")
-	BtnSet.OnEvent("Click", OnBtnSetting)
-	BtnSet.Opt("BackgroundTrans")
-	_gui.Show("x-100 y-100")
-	_gui.Hide()
+	Btn := _gui.AddButton("-Default -Border w15 h15", "⚙")
+	Btn.OnEvent("Click", OnBtnSetting)
+	
 	return _gui
 }
 
@@ -256,116 +289,124 @@ FeedDialog(_WinID, _NewPath) {
 		case "GENERAL":
 			FeedDialog_GENERAL(_WinID, _NewPath)
 		case "SYSLISTVIEW":
-			FeedDialog_SYSLISTVIEW(_WinID, _NewPath)
+			FeedDialog_GENERAL(_WinID, _NewPath)
 	}
 }
 
-FindAllChild(className, hWnd) {
+FindChildByXPath(cls_xpath, hwnd, bClassNN:=False) {
 	GW_HWNDFIRST :=        0
 	GW_HWNDLAST :=         1
 	GW_HWNDNEXT :=         2
 	GW_HWNDPREV :=         3
 	GW_OWNER :=            4
 	GW_CHILD :=            5
-	_child := DllCall("GetWindow", "Ptr", hWnd, "Uint", GW_CHILD|GW_HWNDFIRST)
-	Wnds := []
-	if(_child) {
-		Wnds.Push(FindAllChild(className, _child)*)
-		_cls := ControlGetClassNN(_child)
-		if (InStr(_cls, className))
-			Wnds.Push(_child)
-		Loop {
-			_child := DllCall("GetWindow", "Ptr", _child, "Uint", GW_HWNDNEXT)
-			if(_child) {
-				Wnds.Push(FindAllChild(className, _child)*)
-				_cls := ControlGetClassNN(_child)
-				if (InStr(_cls, className))
-					Wnds.Push(_child)
-			}
-		} Until !_child
+	cls_xpath := StrReplace(cls_xpath, "\", "/")
+	fpos := InStr(cls_xpath, "/")
+	_left_cls := ""
+	if (!fpos) {
+		_need_cls := cls_xpath
+	} else {
+		_need_cls := SubStr(cls_xpath, 1, fpos-1)
+		_left_cls := SubStr(cls_xpath, fpos+1)
 	}
-	return Wnds
+	_child := DllCall("GetWindow", "Ptr", hwnd, "Uint", GW_CHILD|GW_HWNDFIRST)
+	Loop {
+		if(_child) {
+			if (bClassNN)
+				_cls := ControlGetClassNN(_child, hwnd)
+			Else
+				_cls := WinGetClass(_child)
+			if (_need_cls = _cls) {
+				if (_left_cls) {
+					return FindChildByXPath(_left_cls, _child)
+				} else {
+					return _child
+				}
+			}
+			_child := DllCall("GetWindow", "Ptr", _child, "Uint", GW_HWNDNEXT)
+		}
+	} Until !_child
+
+	return 0
 }
+
 ; 设置公共对话框的路径
 FeedDialog_GENERAL(_WinID, _NewPath) {
-	_UseToolbar := ""
-	_EnterToolbar := ""
-	_SetPathOK := False
+	_AddressToolbar := ""
+	; 获取文件名输入框控件
+	_edit := ControlGetHwnd("Edit1", _WinID)
+	If (!_edit) {
+		MsgBox "This type of dialog can not be handled (yet).`nPlease report it!"
+		Return
+	}
+	_edit2 := FindChildByXPath("ComboBoxEx32/ComboBox/Edit", _WinID)
+	_NewPath := RTrim(_NewPath, "\")
+	_NewPath := _NewPath . "\"
+	ControlFocus _edit
+	try {
+		_oldTxt := ControlGetText(_edit,_WinID)
+	} catch {
+		Return
+	}
+	ControlSetText _NewPath, _edit, _WinID
+	ControlSend("{Enter}", _edit, _WinID)
+	; 设置回默认的文件名编辑框焦点
+	ControlSetText _oldTxt, _edit, _WinID
+}
+; 设置公共对话框的路径
+FeedDialog_Test(_WinID, _NewPath) {
+	_AddressToolbar := ""
 	WinActivate(_WinID)
-	; ControlFocus "Edit1", _WinID
+	Sleep(2000)
+	if !WinExist(_WinID) {
+		return
+	}
 	_ctrls := WinGetControls(_WinID)
-	; 确认确实是公共对话框
+	; 获取地址栏控件
 	For c in _ctrls {
 		if (InStr(c, "ToolbarWindow32")) {
 			_hwnd := ControlGetHwnd(c, _WinID)
 			_parent := DllCall("GetParent", "Ptr", _hwnd)
-			_cls := ControlGetClassNN(_parent)
+			_cls := ControlGetClassNN(_parent, _WinID)
 			if(InStr(_cls, "Breadcrumb Parent")) {
-				_UseToolbar := c
-			}
-			if(InStr(_cls, "msctls_progress32")) {
-				_EnterToolbar := c
+				_AddressToolbar := c
 			}
 		}
 	}
-	If (_UseToolbar AND _EnterToolbar) {
-		_loopcount := 0
-		Loop {
-			_loopcount++
-			SendInput "^l" ; 切换地址栏获得焦点 Ctrl+L
-			Sleep(100)
-			Try {
-				_fc := ControlGetFocus("A")
-				_fcc := ControlGetClassNN(_fc)
-				
-				if(InStr(_fcc, "Edit") AND (_fcc != "Edit1"))
-				{
-					; EditPaste(_NewPath, _fc)
-					ControlSetText _NewPath, _fc
-					_txt := ControlGetText(_fc)
-					if (_txt = _NewPath) {
-						_SetPathOK := True
-					}
-				}
-			}
-		} Until _SetPathOK OR (_loopcount > 5)
-		If (_SetPathOK) {
-			ControlSend("{Enter}", _fc)
-			ControlClick _EnterToolbar, _WinID
-			; 设置回默认的文件名编辑框焦点
-			Sleep 10
-			ControlFocus "Edit1", _WinID
-		}
-	} else {
+	If (!_AddressToolbar) {
 		MsgBox "This type of dialog can not be handled (yet).`nPlease report it!"
+		Return
 	}
-}
-; 设置Exploer样式的对话框路径
-FeedDialog_SYSLISTVIEW(_WinID, _NewPath) {
-	WinActivate(_WinID)
-	_edit1 := ControlGetHwnd("Edit1", _WinID)
-	_oldEditValue := ControlGetText(_edit1)
-	_NewPath := RTrim(_NewPath, "\")
-	_NewPath := _NewPath . "\"
-	_LoopCount := 0
-	_FolderSet := False
+	; 循环等待Edit2获得焦点
 	Loop {
-		_LoopCount++
-		Sleep 10
-		; 普通权限进程是无法修改管理员权限进程的对话框的
-		; EditPaste _NewPath, _edit1
-		ControlSetText _NewPath, _edit1
-		_txt := ControlGetText(_edit1)
-		if(_txt = _NewPath)
-			_FolderSet := True
-	} Until _FolderSet OR (_LoopCount > 20)
-	if(_FolderSet) {
-		ControlFocus _edit1
-		ControlSend "{Enter}", _edit1
-		ControlFocus _edit1
-		ControlSetText(_oldEditValue, _edit1)
-	}
+		;ControlClick _AddressToolbar, _WinID,,,,"X15 Y15" ; 点击地址栏，等待隐藏的控件输入框可见并获得焦点
+		; 不使用Ctrl+l获得地址栏输入焦点了，直接通过控件点击
+		SendInput "{Ctrl down}{l down}" ; 切换地址栏获得焦点 Ctrl+L
+		SendInput "{Ctrl up}"
+		_fc := ControlGetFocus(_WinID)
+		if (!_fc) {
+			return
+		}
+		_fcc := ControlGetClassNN(_fc, _WinID)
+		if _fcc = "Edit2" {
+			; if(1) {
+			; 	ControlFocus "Edit1", _WinID
+			; 	return
+			; }
+			ControlSetText _NewPath, _fc, _WinID
+			; Sleep(500)
+			if (ControlGetText(_fc,_WinID) = _NewPath) {
+				
+				ControlFocus _fc, _WinID
+				ControlSend("{Enter}", _fcc, _WinID)
+				; 设置回默认的文件名编辑框焦点
+				ControlFocus "Edit1", _WinID
+				Break
+			}
+		}
+	} Until !WinActive(_WinID)
 }
+
 
 ; Ini
 Class IniConfig {
