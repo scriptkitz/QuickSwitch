@@ -172,20 +172,7 @@ ValidFolder(_path_) {
 ; 获取下一个主窗口包含的文件夹路径
 GetZWindowPath(WinID) {
 	ZFolder := ""
-	_GetNextWinID1(WinID) {
-		WinIDs := WinGetList()
-		_zDelta := 2 
-		; 一般情况弹出对话框的下一层是主窗口，主窗口的下一个窗口就是我们要找的窗口
-		; 所以窗口顺序就是当前对话框+1为主窗口，再+1就是下一个窗口，所以这里默认是2
-		found_idx := -1
-		Loop WinIDs.Length {
-			if (WinIDs[A_Index] = WinID) {
-				found_idx := A_Index
-			}
-		}
-		return WinIDs[found_idx + _zDelta]
-	}
-	_GetNextWinID2(WinID) {
+	_GetNextWinID(WinID) {
 		WinIDs := WinGetList()
 		GA_PARENT := 1
 		GA_ROOT := 2
@@ -200,39 +187,46 @@ GetZWindowPath(WinID) {
 		return WinIDs[found_idx + 1]
 	}
 
-	nextWinID := _GetNextWinID2(WinID)
+	nextWinID := _GetNextWinID(WinID)
 	found_class := WinGetClass(nextWinID)
 	Switch found_class, True {
 		Case "TTOTAL_CMD": ;	Total Commander
 		Case "ThunderRT6FormDC": ;	XYPlorer
 		Case "CabinetWClass": ;	File Explorer
-			For (ComWin in ComObject("Shell.Application").Windows)
-			{
-				_checkID := 0
-				Try {
+			activeTab := ControlGetHwnd("ShellTabWindowClass1", nextWinID)
+			shellApp := ComObject("Shell.Application")
+			For ComWin in shellApp.Windows {
+				try 
 					_checkID := ComWin.hwnd
-				} catch Error as err {
-				}
+				catch
+					continue
 				if (nextWinID = _checkID) {
+					if (activeTab)
+					{
+						static IID_IShellBrowser := "{000214E2-0000-0000-C000-000000000046}"
+						shellBrowser := ComObjQuery(ComWin, IID_IShellBrowser, IID_IShellBrowser)
+						thisTab := 0
+						ComCall(3, shellBrowser, "Ptr*", &thisTab)
+						if (thisTab != activeTab)
+							continue
+					}
 					ZFolder := ComWin.Document.Folder.Self.Path
 					Break
 				}
 			}
 		Case "TablacusExplorer": ;	
-			For (ComWin in ComObject("Shell.Application").Windows)
+			shellApp := ComObject("Shell.Application")
+			For (ComWin in shellApp.Windows)
 			{
-				SplitPath ComWin.FullName, &ProcName
-				if ((0 = StrCompare(ProcName, "TE32.exe", 0)) or (0 = StrCompare(ProcName, "TE64.exe", 0)))
+				SplitPath(ComWin.FullName, &ProcName)
+				if !(ProcName ~= "i)TE(32|64)\.exe")
+					continue
+				if !(ParentWin := ComWin.Document.parentWindow)
+					continue
+				te := ParentWin.te
+				if (te.hwnd = nextWinID)
 				{
-					if (ComWin.Document.parentWindow)
-					{
-						ComWin.Document.parentWindow.execScript("document.tophwnd = GetTopWindow(WebBrowser.hwnd)")
-						if ( nextWinID = ComWin.Document.tophwnd )
-						{
-							ZFolder := ComWin.Document.F.addressbar.value
-							Break
-						}
-					}
+                    ZFolder := te.Ctrl(0).FolderItem.Path
 				}
 			}
 		Case "dopus.lister": ;	Directory Opus
@@ -293,6 +287,32 @@ FeedDialog(_WinID, _NewPath) {
 	}
 }
 
+/**
+ * 判断指定 hwnd 是否为目标类名窗口的后代（子级、孙级等）
+ * @param {Ptr} childHwnd - 要检查的窗口句柄
+ * @param {String} parentClass - 目标的父类名 (例如 "abc")
+ * @returns {Ptr} - 如果匹配，返回找到的父窗口句柄；否则返回 0
+ */
+IsDescendantOfClass(childHwnd, parentClass) {
+    currHwnd := childHwnd
+    
+    ; 循环获取父窗口，直到没有父窗口为止 (返回 0)
+    ; 注意：GetParent 可以获取控件的父窗口，也可以获取子窗口的父窗口
+    while (currHwnd := DllCall("GetParent", "Ptr", currHwnd, "Ptr")) {
+        try {
+            ; 获取当前父窗口的类名
+            if (WinGetClass(currHwnd) = parentClass) {
+                return currHwnd  ; 找到了匹配类名的祖先，返回其句柄
+            }
+        } catch {
+            ; 某些系统窗口可能禁止访问，直接跳过
+            continue
+        }
+    }
+    
+    return 0 ; 溯源到顶层也没找到
+}
+
 FindChildByXPath(cls_xpath, hwnd, bClassNN:=False) {
 	GW_HWNDFIRST :=        0
 	GW_HWNDLAST :=         1
@@ -339,74 +359,38 @@ FeedDialog_GENERAL(_WinID, _NewPath) {
 		MsgBox "This type of dialog can not be handled (yet).`nPlease report it!"
 		Return
 	}
-	_edit2 := FindChildByXPath("ComboBoxEx32/ComboBox/Edit", _WinID)
-	_NewPath := RTrim(_NewPath, "\")
-	_NewPath := _NewPath . "\"
-	ControlFocus _edit
-	try {
-		_oldTxt := ControlGetText(_edit,_WinID)
-	} catch {
-		Return
-	}
-	ControlSetText _NewPath, _edit, _WinID
-	ControlSend("{Enter}", _edit, _WinID)
-	; 设置回默认的文件名编辑框焦点
-	ControlSetText _oldTxt, _edit, _WinID
-}
-; 设置公共对话框的路径
-FeedDialog_Test(_WinID, _NewPath) {
-	_AddressToolbar := ""
-	WinActivate(_WinID)
-	Sleep(2000)
-	if !WinExist(_WinID) {
-		return
-	}
-	_ctrls := WinGetControls(_WinID)
-	; 获取地址栏控件
-	For c in _ctrls {
-		if (InStr(c, "ToolbarWindow32")) {
-			_hwnd := ControlGetHwnd(c, _WinID)
-			_parent := DllCall("GetParent", "Ptr", _hwnd)
-			_cls := ControlGetClassNN(_parent, _WinID)
-			if(InStr(_cls, "Breadcrumb Parent")) {
-				_AddressToolbar := c
-			}
-		}
-	}
-	If (!_AddressToolbar) {
+	_addr_edit := FindChildByXPath("WorkerW/ReBarWindow32/Address Band Root/msctls_progress32/ComboBoxEx32/ComboBox/Edit", _WinID)
+	If (!_addr_edit) {
 		MsgBox "This type of dialog can not be handled (yet).`nPlease report it!"
 		Return
 	}
-	; 循环等待Edit2获得焦点
-	Loop {
-		;ControlClick _AddressToolbar, _WinID,,,,"X15 Y15" ; 点击地址栏，等待隐藏的控件输入框可见并获得焦点
-		; 不使用Ctrl+l获得地址栏输入焦点了，直接通过控件点击
-		SendInput "{Ctrl down}{l down}" ; 切换地址栏获得焦点 Ctrl+L
-		SendInput "{Ctrl up}"
-		_fc := ControlGetFocus(_WinID)
-		if (!_fc) {
-			return
-		}
-		_fcc := ControlGetClassNN(_fc, _WinID)
-		if _fcc = "Edit2" {
-			; if(1) {
-			; 	ControlFocus "Edit1", _WinID
-			; 	return
-			; }
-			ControlSetText _NewPath, _fc, _WinID
-			; Sleep(500)
-			if (ControlGetText(_fc,_WinID) = _NewPath) {
-				
-				ControlFocus _fc, _WinID
-				ControlSend("{Enter}", _fcc, _WinID)
-				; 设置回默认的文件名编辑框焦点
-				ControlFocus "Edit1", _WinID
-				Break
-			}
-		}
-	} Until !WinActive(_WinID)
-}
+	_NewPath := RTrim(_NewPath, "\") "\"
+	
+	WinActivate(_WinID)
+	
+	; 激活DirectUIHWND区域，确保地址栏的ComboBoxEx32能够接收到输入
+	try {
+		ControlFocus("DirectUIHWND2", "ahk_id " _WinID)
+		; ControlClick("DirectUIHWND2", "ahk_id " _WinID, , "LEFT", 1, "NA x5 y5")
+	} catch {
+		ControlFocus("DirectUIHWND1", "ahk_id " _WinID)
+		; ControlClick("DirectUIHWND1", "ahk_id " _WinID, , "LEFT", 1, "NA x5 y5")
+	}
+	Sleep(50)
+	; Send("!d") ; 激活地址栏 Alt+D
+	; Sleep(50)
+	ControlSetText _NewPath, _addr_edit, _WinID
+	Sleep(50)
+	ControlSend("{Enter}", _addr_edit, _WinID)
 
+	; ControlSend("{Enter down}", _addr_edit, _WinID)
+	; WM_CHAR := 0x0102
+	; PostMessage(WM_CHAR, 13, 0, _addr_edit, _WinID)
+	; ControlSend("{Enter up}", _addr_edit, _WinID)
+	; Sleep(50)
+	
+	Sleep(10)
+}
 
 ; Ini
 Class IniConfig {
