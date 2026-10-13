@@ -2,6 +2,7 @@
 #Singleinstance Force
 
 #Include "Sqlite.ahk"
+#Include "Everything3.ahk"
 
 SetWinDelay -1
 SetControlDelay -1
@@ -40,7 +41,8 @@ WM_UPDATEUISTATE := 0x0128
 BAR_H := 30
 BAR_BTN_W := 32
 BAR_GAP := 4
-COMBO_PATH_PREFIX := "📁 "   ; 下拉里"最近文件夹路径"项的前缀，用于区分选中项类型
+COMBO_PATH_PREFIX := "📁 "   ; 下拉项前缀：文件夹(最近路径 / 目录搜索结果)
+COMBO_FILE_PREFIX := "📄 "   ; 下拉项前缀：文件(Everything 搜索结果)
 INVALID_TEXT := "无效路径"    ; 输入非法路径时在搜索框里显示的红色提示
 
 G_DlgHwnd := 0
@@ -58,6 +60,18 @@ G_BarChildW := -1   ; 子控件上次按多宽排过版
 G_BarGui := CreateBarWnd()
 G_BarHwnd := G_BarGui.Hwnd
 G_SearchText := ""
+G_ErrText := ""          ; 当前以红字显示在搜索框里的提示文本
+G_Jumping := False       ; 跳转防重入（双击/回车重复触发时只执行一次）
+; 搜索结果列表（独立 ListView 窗口）
+G_ListGui := 0
+G_List := 0              ; ListView 控件
+G_ListHwnd := 0          ; 列表窗口句柄（0 = 未显示）
+G_ListItems := []        ; 行号 → 完整路径
+G_ListH := 66            ; 列表窗口高度（显示时按行数算）
+LIVE_DELAY := 150        ; 实时搜索防抖(ms)：停手 150ms 才真正查一次
+G_LastQuery := ""        ; 上次已搜过的关键词，避免重复查
+; 主显示器工作区（判断"下方放不下则翻到对话框上方"）
+MonitorGetWorkArea(MonitorGetPrimary(), &WK_L, &WK_T, &WK_R, &WK_B)
 ; 设置项
 G_bEnableBar := G_IniConfig.ReadSetting("enable_bar", 1) ? True : False
 G_bDefaultAutoSwitch := G_IniConfig.ReadSetting("default_autoswitch", 1) ? True : False
@@ -176,12 +190,14 @@ CreateBarWnd() {
 
 ; 显示底部工具条，并把位置钩子限定到该对话框所在线程。
 ShowBar(_WinID) {
-	global G_BarGui, G_BarHwnd, G_BarChildW, G_bEnableBar
+	global G_BarGui, G_BarHwnd, G_BarChildW, G_bEnableBar, G_LastQuery
 	if (!G_BarGui || !G_bEnableBar)
 		return
 	G_BarHwnd := G_BarGui.Hwnd
 	G_BarChildW := -1          ; 强制重新排布子控件
-	RefreshComboItems(True)    ; 按当前对话框重建下拉：最近文件夹路径 + 搜索关键词历史
+	G_LastQuery := ""          ; 新会话：清掉"已搜过"记性
+	G_LastQuery := ""          ; 新会话：清掉"已搜过"记性
+	RefreshComboItems(True)    ; 按当前对话框重建下拉：最近文件夹路径 + 输入历史
 	HookDialogThread(_WinID)
 	RepositionBar(_WinID)
 }
@@ -189,6 +205,7 @@ ShowBar(_WinID) {
 HideBar() {
 	global G_BarHwnd
 	UnhookDialogThread()
+	HideResultList()
 	if (G_BarHwnd && DllCall("IsWindow", "Ptr", G_BarHwnd))
 		DllCall("SetWindowPos", "Ptr", G_BarHwnd, "Ptr", 0, "Int", 0, "Int", 0, "Int", 0, "Int", 0, "UInt", SWP_HIDEWINDOW | SWP_NOACTIVATE, "Int")
 	G_BarHwnd := 0
@@ -257,21 +274,27 @@ RepositionBar(_WinID) {
 		DllCall("SetWindowPos", "Ptr", G_ComboHwnd, "Ptr", 0, "Int", 4, "Int", G_ComboY, "Int", _w - 8 - BAR_BTN_W - BAR_GAP, "Int", G_ComboWinH, "UInt", SWP_NOZORDER | SWP_NOACTIVATE, "Int")
 		DllCall("SetWindowPos", "Ptr", G_BarBtnHwnd, "Ptr", 0, "Int", _w - 4 - BAR_BTN_W, "Int", G_BtnY, "Int", BAR_BTN_W, "Int", BAR_H - 6, "UInt", SWP_NOZORDER | SWP_NOACTIVATE, "Int")
 	}
+	; 结果列表若正在显示，跟着一起走
+	RepositionResultList()
 }
 
 ; 等待"对话框会话"结束。用 WinWaitNotActive（AHK 内置的前台等待，开销极低）代替 30ms 轮询；
 ; 仅当焦点落在工具条上时才短暂轮询，避免因工具条持有焦点而误判会话未结束。
 WaitDialogSessionEnd(WinID) {
-	global G_BarHwnd, G_PrefGui
+	global G_BarHwnd, G_PrefGui, G_ListHwnd
 	Loop {
 		WinWaitNotActive(WinID)
 		if (!DllCall("IsWindow", "Ptr", WinID))
 			return
+		; 焦点落在本工具自己的窗口上(工具条 / 结果列表 / 首选项)也算会话进行中
 		if (G_BarHwnd && WinActive("ahk_id " G_BarHwnd)) {
 			Sleep 30
 			continue
 		}
-		; 首选项对话框打开时也算会话进行中，避免工具条被隐藏
+		if (G_ListHwnd && WinActive("ahk_id " G_ListHwnd)) {
+			Sleep 30
+			continue
+		}
 		if (G_PrefGui) {
 			try {
 				if (WinActive("ahk_id " G_PrefGui.Hwnd)) {
@@ -294,53 +317,112 @@ WinEventProc(hHook, event, hwnd, idObject, idChild, dwEventThread, dwmsEventTime
 
 ; ComboBox Change：打字或从下拉里选择都会触发
 OnSearchInput(GuiCtrlObj, Info) {
-	global G_SearchText, G_DlgHwnd
+	global G_SearchText
 	t := GuiCtrlObj.Text
-	; 选中的是"最近文件夹路径"项 → 让文件对话框切换到该文件夹，并清空搜索框
-	if (t != "" && SubStr(t, 1, StrLen(COMBO_PATH_PREFIX)) = COMBO_PATH_PREFIX) {
-		p := Trim(SubStr(t, StrLen(COMBO_PATH_PREFIX) + 1))
-		if (ValidFolder(p)) {
-			FeedDialog(G_DlgHwnd, p)
+	; 选中的是路径项(📁 目录 / 📄 文件) → 跳转，并清空搜索框
+	if (t != "" && IsPathItemText(t)) {
+		if (JumpToPath(StripItemPrefix(t))) {
 			G_SearchText := ""
 			GuiCtrlObj.Text := ""
 			return
 		}
 	}
 	G_SearchText := t
+	; 防抖实时搜索：每次输入都重置一次性定时器 → 停手 LIVE_DELAY 毫秒才真正查一次
+	SetTimer(LiveSearch, -LIVE_DELAY)
 }
 
 ; 隐藏默认按钮的 Click：搜索框中按 Enter 时触发。
-; 输入按"路径"处理：目录 → 直接跳转；文件 → 跳到所在目录并填好文件名；
-; 无效 → 搜索框红字提示 + 系统错误提示音。
+; 有效路径(目录/文件) → 跳转；像路径但不存在 → 红字报错；
+; 其余 → 立即走 Everything 搜索，结果显示在独立 ListView 里。
 OnSearchSubmit(GuiCtrlObj, Info) {
-	global G_SearchText, G_IniConfig, G_Combo, G_DlgHwnd
+	global G_SearchText, G_IniConfig, G_Combo, G_ErrText
 	q := Trim(G_SearchText)
-	; 忽略：空输入、下拉里的"路径项"(选中时已处理)、我们自己的红字提示
-	if (q = "" || q = INVALID_TEXT)
+	; 忽略：空输入、我们自己的红字提示、下拉里的路径项(选中时已处理)
+	if (q = "" || q = G_ErrText)
 		return
-	if (SubStr(q, 1, StrLen(COMBO_PATH_PREFIX)) = COMBO_PATH_PREFIX)
+	if (IsPathItemText(q))
 		return
 	p := ExpandPath(q)
-	attr := FileExist(p)
-	if (attr = "") {
-		ShowInvalidPath()
+	if (FileExist(p) != "") {
+		JumpToPath(p)
+		G_IniConfig.AddSearchHistory(q)
+		RefreshComboItems(False)
+		if (G_Combo) {
+			G_Combo.Text := ""
+			G_SearchText := ""
+		}
 		return
 	}
-	if (InStr(attr, "D")) {
-		FeedDialog(G_DlgHwnd, p)              ; 目录：直接跳转
-	} else {
-		SplitPath(p, &_name, &_dir)           ; 文件：先跳到所在目录
-		FeedDialog(G_DlgHwnd, _dir)
-		Sleep 120
-		SetDlgFileName(G_DlgHwnd, _name)      ; 再把文件名填进"文件名"框（≈选中该文件）
+	; 明显像路径却不存在 → 提示"无效路径"
+	if (IsPathLike(q)) {
+		ShowSearchError(INVALID_TEXT)
+		return
 	}
-	; 记住这次输入并刷新下拉，然后清空搜索框
-	G_IniConfig.AddSearchHistory(q)
-	RefreshComboItems(False)
-	if (G_Combo) {
-		G_Combo.Text := ""
-		G_SearchText := ""
+	; 其余按关键词走 Everything 搜索（实现见 Everything3.ahk）：回车 → 立即搜并聚焦列表
+	res := Ev3_Search(q)
+	if (!IsObject(res)) {                       ; 0 = 不可用（DLL 缺失 / Everything 未运行）
+		ShowSearchError("Everything 未运行")
+		return
 	}
+	if (!res.Length) {
+		ShowSearchError("无匹配结果")
+		return
+	}
+	G_LastQuery := q
+	ShowResultList(res, True)
+	ToolTip("找到 " . res.Length . " 项")
+	SetTimer(() => ToolTip(), -1800)
+}
+
+; —— 路径相关 ——
+
+; 跳转到指定路径：目录直达；文件则跳到所在目录并把文件名填进"文件名"框(≈选中)。
+; 走 safe 模式：回车只交给地址栏消费，绝不落到对话框默认按钮
+;（否则"选择文件夹"对话框会被直接确定）。另加防重入，避免双击/回车重复触发。
+JumpToPath(p) {
+	global G_DlgHwnd, G_Jumping
+	if (G_Jumping || !DllCall("IsWindow", "Ptr", G_DlgHwnd))
+		return False
+	attr := FileExist(p)
+	if (attr = "")
+		return False
+	G_Jumping := True
+	try {
+		if (InStr(attr, "D")) {
+			FeedDialog(G_DlgHwnd, p, True)
+		} else {
+			SplitPath(p, &_name, &_dir)
+			FeedDialog(G_DlgHwnd, _dir, True)
+			Sleep 150
+			SetDlgFileName(G_DlgHwnd, _name)
+		}
+	} catch {
+		G_Jumping := False
+		return False
+	}
+	G_Jumping := False
+	return True
+}
+
+; 文本是否是下拉里的"路径项"(📁 目录 / 📄 文件)
+IsPathItemText(t) {
+	return SubStr(t, 1, StrLen(COMBO_PATH_PREFIX)) = COMBO_PATH_PREFIX
+	    || SubStr(t, 1, StrLen(COMBO_FILE_PREFIX)) = COMBO_FILE_PREFIX
+}
+
+; 去掉下拉项前缀，取出真实路径
+StripItemPrefix(t) {
+	if (SubStr(t, 1, StrLen(COMBO_PATH_PREFIX)) = COMBO_PATH_PREFIX)
+		return Trim(SubStr(t, StrLen(COMBO_PATH_PREFIX) + 1))
+	if (SubStr(t, 1, StrLen(COMBO_FILE_PREFIX)) = COMBO_FILE_PREFIX)
+		return Trim(SubStr(t, StrLen(COMBO_FILE_PREFIX) + 1))
+	return t
+}
+
+; 输入看起来像路径(含 \ 或 :) —— 用于区分"打错的路径"与"搜索关键词"
+IsPathLike(s) {
+	return InStr(s, "\") || InStr(s, ":")
 }
 
 ; 展开 %环境变量% 并去掉首尾成对引号
@@ -357,33 +439,199 @@ ExpandPath(s) {
 	return s
 }
 
-; 把文件名填进公共对话框的"文件名"输入框(Edit1)
-SetDlgFileName(_WinID, name) {
-	_edit := ControlGetHwnd("Edit1", _WinID)
-	if (!_edit)
-		return
-	ControlSetText(name, "ahk_id " _edit)
+; 把文件名填进公共对话框的"文件名"输入框(Edit1)。
+; ⚠ FeedDialog 触发导航后，对话框会重建控件，刚取到的句柄可能随即失效
+;   （表现为 "target control not found"）→ 这里重试 + 校验，且任何异常都不外抛。
+SetDlgFileName(_WinID, name, retries := 6) {
+	Loop retries {
+		try {
+			_edit := ControlGetHwnd("Edit1", _WinID)
+			if (_edit) {
+				ControlSetText(name, "ahk_id " _edit)
+				Sleep 25
+				; 导航若尚未结束，刚填的名字可能被重置 → 校验，不通过就重试
+				if (InStr(ControlGetText("Edit1", _WinID), name))
+					return True
+			}
+		} catch {
+			; 控件正在重建：忽略，稍后重试
+		}
+		Sleep 60
+	}
+	return False
 }
 
-; 无效路径：搜索框红字提示 + 系统错误提示音，1.5 秒后自动恢复
-ShowInvalidPath() {
-	global G_Combo, G_SearchText
+; 搜索框红字提示 + 系统错误提示音，约 1.8 秒后自动恢复
+ShowSearchError(msg) {
+	global G_Combo, G_SearchText, G_ErrText
 	if (!G_Combo)
 		return
+	G_ErrText := msg
 	try G_Combo.SetFont("cRed")
-	G_Combo.Text := INVALID_TEXT
+	G_Combo.Text := msg
 	G_SearchText := ""
 	DllCall("MessageBeep", "UInt", 0x10)   ; MB_ICONHAND：系统"错误"提示音
-	SetTimer(ClearInvalidPath, -1500)
+	SetTimer(ClearSearchError, -1800)
 }
 
-ClearInvalidPath() {
-	global G_Combo
+ClearSearchError() {
+	global G_Combo, G_ErrText
 	if (!G_Combo)
 		return
 	try G_Combo.SetFont("cDefault")
-	if (G_Combo.Text = INVALID_TEXT)
+	if (G_ErrText != "" && G_Combo.Text = G_ErrText)
 		G_Combo.Text := ""
+	G_ErrText := ""
+}
+
+; Everything3 的 SDK 封装在 Everything3.ahk（Ev3_Search / Ev3_Reset / Ev3_LastError）
+
+; ===== 搜索结果列表：独立 ListView 窗口，默认贴工具条下方；下方放不下则翻到对话框上方 =====
+
+CreateListWnd() {
+	global G_ListGui, G_List
+	if (G_ListGui)
+		return
+	g := Gui("+ToolWindow -Caption +AlwaysOnTop", "QuickSwitch Results")
+	g.MarginX := 0
+	g.MarginY := 0
+	g.BackColor := "FFFFFF"
+	lv := g.AddListView("x0 y0 w600 h200 Grid", ["名称", "完整路径"])
+	lv.OnEvent("DoubleClick", OnListPick)
+	; 隐藏默认按钮：焦点在列表里时按 Enter 也能跳转
+	hb := g.AddButton("Default Hidden w1 h1", "")
+	hb.OnEvent("Click", OnListEnter)
+	g.OnEvent("Escape", OnListClose)
+	g.OnEvent("Close", OnListClose)
+	G_List := lv
+	G_ListGui := g
+}
+
+; 用结果刷新 ListView。
+; activate=True 时才抢焦点（回车触发时用）；实时搜索必须 False，否则会打断打字。
+; 批量填充期间关掉重绘(-Redraw)，避免逐行刷新导致的卡顿。
+ShowResultList(paths, activate := False) {
+	global G_List, G_ListGui, G_ListHwnd, G_ListItems, G_ListH
+	CreateListWnd()
+	G_ListItems := paths
+	G_List.Opt("-Redraw")
+	G_List.Delete()
+	for p in paths {
+		SplitPath(p, &_nm)
+		G_List.Add("", _nm, p)
+	}
+	n := paths.Length
+	_rows := (n > 12) ? 12 : n
+	G_ListH := _rows * 22 + 30
+	if (G_ListH < 66)
+		G_ListH := 66
+	if (!ListGeom(&_x, &_y, &_w, &_h)) {
+		G_List.Opt("+Redraw")
+		return
+	}
+	G_List.Move(0, 0, _w, _h)
+	G_List.ModifyCol(1, Round(_w * 0.38))
+	G_List.ModifyCol(2, Round(_w * 0.62) - 22)
+	G_List.Opt("+Redraw")
+	G_ListGui.Show(Format("NA x{} y{} w{} h{}", _x, _y, _w, _h))
+	G_ListHwnd := G_ListGui.Hwnd
+	if (activate) {
+		G_List.Modify(1, "Select Focus Vis")
+		try WinActivate(G_ListHwnd)
+		G_List.Focus()
+	}
+}
+
+HideResultList() {
+	global G_ListGui, G_ListHwnd
+	G_ListHwnd := 0
+	if (G_ListGui)
+		try G_ListGui.Hide()
+}
+
+; 计算列表几何（屏幕坐标）。纯 DllCall/NumGet，可被 Fast 回调调用。
+ListGeom(&x, &y, &w, &h) {
+	global G_DlgHwnd, G_ListH, BAR_H, WK_L, WK_T, WK_R, WK_B
+	static _r := Buffer(16)
+	x := 0, y := 0, w := 0, h := G_ListH
+	if (!DllCall("GetWindowRect", "Ptr", G_DlgHwnd, "Ptr", _r))
+		return False
+	_dl := NumGet(_r, 0, "Int")
+	_dt := NumGet(_r, 4, "Int")
+	_dr := NumGet(_r, 8, "Int")
+	_db := NumGet(_r, 12, "Int")
+	w := _dr - _dl
+	if (w < 300)
+		w := 300
+	x := _dl
+	y := _db + BAR_H                       ; 优先贴工具条下方
+	if (y + h > WK_B) {                    ; 下方放不下 → 翻到对话框上方
+		y := _dt - h
+		if (y < WK_T)
+			y := WK_T
+	}
+	if (x + w > WK_R)
+		x := WK_R - w
+	if (x < WK_L)
+		x := WK_L
+	return True
+}
+
+; 跟随对话框移动（只移动，不改尺寸/层位 → Fast 回调安全）
+RepositionResultList() {
+	global G_ListHwnd
+	if (!G_ListHwnd)
+		return
+	if (!ListGeom(&_x, &_y, &_w, &_h))
+		return
+	DllCall("SetWindowPos", "Ptr", G_ListHwnd, "Ptr", 0, "Int", _x, "Int", _y, "Int", 0, "Int", 0, "UInt", SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOSENDCHANGING, "Int")
+}
+
+OnListPick(LV, Row) {
+	global G_ListItems
+	if (Row >= 1 && Row <= G_ListItems.Length) {
+		_p := G_ListItems[Row]
+		HideResultList()
+		JumpToPath(_p)
+	}
+}
+
+OnListEnter(GuiCtrlObj, Info) {
+	global G_List, G_ListItems
+	r := G_List.GetNext()
+	if (r >= 1 && r <= G_ListItems.Length) {
+		_p := G_ListItems[r]
+		HideResultList()
+		JumpToPath(_p)
+	}
+}
+
+OnListClose(GuiObj) {
+	HideResultList()
+}
+
+; ===== 实时搜索（边打边搜）=====
+; 输入每次变化都重置一个一次性定时器 → 停手 LIVE_DELAY 毫秒才真正查一次，打字不会卡。
+LiveSearch() {
+	global G_Combo, G_DlgHwnd, G_LastQuery, G_ErrText
+	if (!G_Combo || !DllCall("IsWindow", "Ptr", G_DlgHwnd))
+		return
+	q := Trim(G_Combo.Text)
+	if (q = "" || q = G_ErrText) {
+		G_LastQuery := ""
+		HideResultList()
+		return
+	}
+	; 与上次相同、或属于路径类(交给回车处理) → 不重复/不实时搜
+	if (q = G_LastQuery || IsPathItemText(q) || IsPathLike(q))
+		return
+	G_LastQuery := q
+	res := Ev3_Search(q)
+	if (!IsObject(res) || !res.Length) {
+		HideResultList()
+		return
+	}
+	ShowResultList(res, False)          ; 不抢焦点，避免打断打字
 }
 
 ; 严重目录是否正确
@@ -506,12 +754,12 @@ GetFileDialogType(WinID) {
 	Return FALSE
 }
 
-FeedDialog(_WinID, _NewPath) {
+FeedDialog(_WinID, _NewPath, _safe := False) {
 	switch _G_FDType {
 		case "GENERAL":
-			FeedDialog_GENERAL(_WinID, _NewPath)
+			FeedDialog_GENERAL(_WinID, _NewPath, _safe)
 		case "SYSLISTVIEW":
-			FeedDialog_GENERAL(_WinID, _NewPath)
+			FeedDialog_GENERAL(_WinID, _NewPath, _safe)
 	}
 }
 
@@ -579,10 +827,24 @@ FindChildByXPath(cls_xpath, hwnd, bClassNN:=False) {
 }
 
 ; 设置公共对话框的路径
-FeedDialog_GENERAL(_WinID, _NewPath) {
+; 取对话框里当前拥有键盘焦点的控件 hwnd（取不到返回 0）
+GetFocusedCtrlHwnd(_WinID) {
+	try {
+		_cls := ControlGetFocus("ahk_id " _WinID)
+		if (_cls)
+			return ControlGetHwnd(_cls, _WinID)
+	}
+	return 0
+}
+
+FeedDialog_GENERAL(_WinID, _NewPath, _safe := False) {
 	_AddressToolbar := ""
-	; 获取文件名输入框控件
-	_edit := ControlGetHwnd("Edit1", _WinID)
+	; 获取文件名输入框控件（对话框可能正在重建控件 → 容错，不要抛异常）
+	_edit := 0
+	try
+		_edit := ControlGetHwnd("Edit1", _WinID)
+	catch
+		_edit := 0
 	If (!_edit) {
 		MsgBox "This type of dialog can not be handled (yet).`nPlease report it!1"
 		Return
@@ -595,22 +857,34 @@ FeedDialog_GENERAL(_WinID, _NewPath) {
 	}
 	_NewPath := RTrim(_NewPath, "\") "\"
 	
-	WinActivate(_WinID)
+	try WinActivate(_WinID)
 	
 	; 激活DirectUIHWND区域，确保地址栏的ComboBoxEx32能够接收到输入
-	try {
+	try
 		ControlFocus("DirectUIHWND2", "ahk_id " _WinID)
 		; ControlClick("DirectUIHWND2", "ahk_id " _WinID, , "LEFT", 1, "NA x5 y5")
-	} catch {
-		ControlFocus("DirectUIHWND1", "ahk_id " _WinID)
+	catch
+		try ControlFocus("DirectUIHWND1", "ahk_id " _WinID)
 		; ControlClick("DirectUIHWND1", "ahk_id " _WinID, , "LEFT", 1, "NA x5 y5")
-	}
 	Sleep(50)
 	; Send("!d") ; 激活地址栏 Alt+D
 	; Sleep(50)
-	ControlSetText _NewPath, _addr_edit, _WinID
-	Sleep(50)
-	ControlSend("{Enter}", _addr_edit, _WinID)
+	; —— 导航：写地址栏 + 给地址栏发回车 ——
+	; 实测结论（自建"选择文件夹"对话框复现，用 WinGetText 判定是否真导航）：
+	;   * ControlFocus 无法把焦点交给地址栏；Alt+D 会重置地址栏文本 → 两者都会让导航失效。
+	;   * 唯一有效的是本段逻辑：这个回车由地址栏自己消费，只做导航。
+	;   * 回车后把焦点还给文件列表：万一有残留回车，也只会落到列表上而不是对话框默认按钮。
+	try {
+		ControlSetText _NewPath, _addr_edit, _WinID
+		Sleep(50)
+		ControlSend("{Enter}", _addr_edit, _WinID)
+		if (_safe) {
+			Sleep(120)
+			try ControlFocus("DirectUIHWND2", "ahk_id " _WinID)
+			catch
+				try ControlFocus("DirectUIHWND1", "ahk_id " _WinID)
+		}
+	}
 
 	; ControlSend("{Enter down}", _addr_edit, _WinID)
 	; WM_CHAR := 0x0102
