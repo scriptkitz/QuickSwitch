@@ -28,13 +28,31 @@ WS_POPUP   := 0x80000000
 WS_CHILD   := 0x40000000
 WS_VISIBLE := 0x10000000
 
+SWP_NOZORDER := 0x4
+SWP_NOSENDCHANGING := 0x400
+EVENT_OBJECT_LOCATIONCHANGE := 0x800B
+OBJID_WINDOW := 0
+
 WM_CHANGEUISTATE := 0x0127
 WM_UPDATEUISTATE := 0x0128
+
+; 底部工具条几何参数：[ ComboBox ] [ ⚙ ] 同一父窗口并排，贴在对话框下边缘外侧
+BAR_H := 30
+BAR_BTN_W := 32
+BAR_GAP := 4
 
 G_DlgHwnd := 0
 G_LastSetDlg := 0 ; 最后一次自动切换路径的对话框
 G_Menu := Menu()
-G_ToolWnd := CreateToolWnd()
+G_ComboHwnd := 0
+G_BarBtnHwnd := 0
+G_BarGui := CreateBarWnd()
+G_BarHwnd := G_BarGui.Hwnd
+G_SearchText := ""
+; 注册全局窗口事件钩子：监听文件对话框自身的位置/尺寸变化，同步搜索框位置。
+; 用 WINEVENT_OUTOFCONTEXT(默认 flags=0) 以便跨进程捕获其它程序的对话框事件。
+G_WinEventProc := CallbackCreate(WinEventProc, "Fast", 7)
+G_WinEventHook := DllCall("SetWinEventHook", "UInt", EVENT_OBJECT_LOCATIONCHANGE, "UInt", EVENT_OBJECT_LOCATIONCHANGE, "Ptr", 0, "Ptr", G_WinEventProc, "UInt", 0, "UInt", 0, "UInt", 0, "Ptr")
 _G_DialogFinger := ""
 _G_FDType := ""
 _G_bAutoSwitch := True
@@ -44,7 +62,7 @@ Loop {
 	_G_FDType := GetFileDialogType(WinID)
 	if (_G_FDType) {
 		G_DlgHwnd := WinID
-		UpToolWndParentAndPos(WinID)
+		ShowBar(WinID)
 		; 激活的窗口在失去激活前只能自动设置一次路径。
 		if (G_LastSetDlg = G_DlgHwnd) { 
 			Continue
@@ -67,52 +85,21 @@ Loop {
 			FeedDialog(WinID, FolderPath)
 		}
 
-		WinWaitNotActive(WinID)
+		WaitDialogSessionEnd(WinID)
 		G_IniConfig.WriteDialogPaths(_G_DialogFinger, FolderPath)
-		_HideToolWnd(0)
+		HideBar()
 		G_LastSetDlg := 0
 	}
 }
 ExitApp(0)
-
-_HideToolWnd(ParentWnd){
-	_style := WinGetStyle(G_ToolWnd.Hwnd)
-	_style := _style | WS_POPUP
-	_style := _style & ~WS_VISIBLE
-	WinSetStyle _style, G_ToolWnd.Hwnd
-	preWnd := DllCall("SetParent", "Ptr", G_ToolWnd.Hwnd, "Ptr", ParentWnd)
-	flag := SWP_HIDEWINDOW
-	DllCall("SetWindowPos", "Ptr", G_ToolWnd.Hwnd, "Ptr", 0, "Int", 0,"Int", 0, "Int", 50, "Int", 50, "UInt", flag, "Int")
-}
 
 MAKELONG(LOWORD,HIWORD,Hex:=0){
     BITS:=0x10,WORD:=0xFFFF
     return (!Hex)?((HIWORD<<BITS)|(LOWORD&WORD)):Format("{1:#x}",((HIWORD<<BITS)|(LOWORD&WORD)))
 }
 
-_ShowToolWnd(ParentWnd){
-	_style := 0
-	_style := _style & ~WS_POPUP
-	_style := _style | WS_CHILD
-	_style := _style | WS_VISIBLE
-	WinSetStyle _style, G_ToolWnd.Hwnd
-	preWnd := DllCall("SetParent", "Ptr", G_ToolWnd.Hwnd, "Ptr", ParentWnd)
-}
-
-UpToolWndParentAndPos(_WinID) {
-	WinGetPos &x, &y, &w, &h, _WinID
-	WinGetPos &cx, &cy, &cw, &ch, G_ToolWnd.Hwnd
-	_parent := DllCall("GetParent", "Ptr", G_ToolWnd.Hwnd)
-	if (_parent != _WinID) {
-		_ShowToolWnd(_WinID)
-	}
-
-	flag := SWP_SHOWWINDOW|SWP_DRAWFRAME
-	; 这里的大小如果是50，50，则导致第一次显示正常，后面就显示不出来了，但可以点击到，不知道是否BUG，只好用100，100了
-	DllCall("SetWindowPos", "Ptr", G_ToolWnd.Hwnd, "Ptr", 0, "Int", 0,"Int", 0, "Int", 100, "Int", 100, "UInt", flag, "Int")
-}
-
 OnBtnSetting(Obj, info) {
+	global G_BarHwnd
 	AUTOSWITCH := "自动切换"
 	OnMenuPath(_name, _pos, _menu) {
 		if (AUTOSWITCH = _name) {
@@ -133,29 +120,129 @@ OnBtnSetting(Obj, info) {
 	}
 	ControlGetPos &cx, &cy, &cw, &ch, Obj
 
+	; 菜单挂到工具条窗口下，显示在 ⚙ 按钮正下方
 	_parent := DllCall("GetParent", "Ptr", G_Menu.Handle)
-	if (_parent != G_ToolWnd.hwnd) {
-		_style := 0
-		_style := _style & ~WS_POPUP
-		_style := _style | WS_CHILD
-		_style := _style | WS_VISIBLE
-		WinSetStyle _style, G_ToolWnd.hwnd
-		DllCall("SetParent", "Ptr", G_Menu.Handle, "Ptr", G_ToolWnd.hwnd)
+	if (_parent != G_BarHwnd) {
+		DllCall("SetParent", "Ptr", G_Menu.Handle, "Ptr", G_BarHwnd)
 	}
 	G_Menu.Show(cx, cy+ch)
 }
 
-CreateToolWnd() {
-	_gui := Gui("")
-	_gui.MarginX := 0
-	_gui.MarginY := 0
-	_gui.BackColor := "Silver"
-	_gui.SetFont("s8")
-	WinSetTransColor "Silver", _gui
-	Btn := _gui.AddButton("-Default -Border w15 h15", "⚙")
-	Btn.OnEvent("Click", OnBtnSetting)
-	
+; ===== 底部工具条（单一父窗口）：[ ComboBox ] [ ⚙ ]，跟随系统文件对话框显示与移动 =====
+CreateBarWnd() {
+	global G_ComboHwnd, G_BarBtnHwnd
+	_gui := Gui("+ToolWindow -Caption +AlwaysOnTop")
+	_gui.MarginX := 4
+	_gui.MarginY := 3
+	_gui.BackColor := "F2F2F2"
+	; ComboBox：以后用 Add()/Delete() 放输入历史，可下拉选择（h200 为下拉列表高度）
+	_combo := _gui.AddComboBox("w280 h200", [])
+	G_ComboHwnd := _combo.Hwnd
+	_combo.OnEvent("Change", OnSearchInput)
+	; ⚙ 按钮（位置/尺寸由 RepositionBar 统一布局；未来承载菜单/配置）
+	_btn := _gui.AddButton("x300 y3 w32 h24", "⚙")
+	G_BarBtnHwnd := _btn.Hwnd
+	_btn.OnEvent("Click", OnBtnSetting)
+	; 隐藏默认按钮：捕获 Enter（ComboBox 没有 KeyDown 事件）
+	_hbtn := _gui.AddButton("Default Hidden w1 h1", "")
+	_hbtn.OnEvent("Click", OnSearchSubmit)
 	return _gui
+}
+
+; 显示底部工具条。
+ShowBar(_WinID) {
+	global G_BarGui, G_BarHwnd
+	if (!G_BarGui)
+		return
+	G_BarHwnd := G_BarGui.Hwnd
+	RepositionBar(_WinID)
+}
+
+HideBar() {
+	global G_BarHwnd
+	if (G_BarHwnd && DllCall("IsWindow", "Ptr", G_BarHwnd))
+		DllCall("SetWindowPos", "Ptr", G_BarHwnd, "Ptr", 0, "Int", 0, "Int", 0, "Int", 0, "Int", 0, "UInt", SWP_HIDEWINDOW | SWP_NOACTIVATE, "Int")
+	G_BarHwnd := 0
+}
+
+; 把工具条贴到对话框下边缘外侧（屏幕坐标），并排好内部 [ ComboBox | ⚙ ]。
+; 可被 Fast 回调直接调用：只用 DllCall/Buffer/NumGet。
+RepositionBar(_WinID) {
+	global G_BarHwnd, G_ComboHwnd, G_BarBtnHwnd, BAR_H, BAR_BTN_W, BAR_GAP
+	if (!G_BarHwnd)
+		return
+	if (!DllCall("IsWindow", "Ptr", _WinID))
+		return
+	_rect := Buffer(16)
+	if (!DllCall("GetWindowRect", "Ptr", _WinID, "Ptr", _rect))
+		return
+	_l := NumGet(_rect, 0, "Int")
+	_r := NumGet(_rect, 8, "Int")
+	_b := NumGet(_rect, 12, "Int")
+	_w := _r - _l
+	if (_w < 200)
+		_w := 200
+	; 工具条窗：贴在对话框下边缘外侧，宽度与对话框一致，用 SWP_NOZORDER 保持 AlwaysOnTop 层位
+	DllCall("SetWindowPos", "Ptr", G_BarHwnd, "Ptr", 0, "Int", _l, "Int", _b, "Int", _w, "Int", BAR_H, "UInt", SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOSENDCHANGING, "Int")
+	; 行高取 ComboBox 的可见高度(CB_GETITEMHEIGHT -1 = 选择区高度)，让 ⚙ 与 ComboBox 严格同高同顶、垂直居中
+	_row_h := 24
+	if (G_ComboHwnd && DllCall("IsWindow", "Ptr", G_ComboHwnd)) {
+		_eh := DllCall("SendMessage", "Ptr", G_ComboHwnd, "UInt", 0x0154, "Ptr", -1, "Ptr", 0, "Ptr")
+		if (_eh > 10)
+			_row_h := _eh
+	}
+	_ry := (BAR_H - _row_h) // 2
+	; ComboBox：占满左侧（只改宽度与纵向位置，高度沿用创建值，避免破坏下拉列表高度）
+	if (G_ComboHwnd && DllCall("IsWindow", "Ptr", G_ComboHwnd)) {
+		_crect := Buffer(16)
+		DllCall("GetWindowRect", "Ptr", G_ComboHwnd, "Ptr", _crect)
+		_chh := NumGet(_crect, 12, "Int") - NumGet(_crect, 4, "Int")
+		_cw := _w - 8 - BAR_BTN_W - BAR_GAP
+		DllCall("SetWindowPos", "Ptr", G_ComboHwnd, "Ptr", 0, "Int", 4, "Int", _ry, "Int", _cw, "Int", _chh, "UInt", SWP_NOZORDER | SWP_NOACTIVATE, "Int")
+	}
+	; ⚙ 按钮：右侧，与 ComboBox 同顶同高
+	if (G_BarBtnHwnd && DllCall("IsWindow", "Ptr", G_BarBtnHwnd))
+		DllCall("SetWindowPos", "Ptr", G_BarBtnHwnd, "Ptr", 0, "Int", _w - 4 - BAR_BTN_W, "Int", _ry, "Int", BAR_BTN_W, "Int", _row_h, "UInt", SWP_NOZORDER | SWP_NOACTIVATE, "Int")
+}
+
+; 等待"对话框会话"结束：对话框被销毁，或对话框与工具条都不再是前台窗口。
+; 关键：把焦点落在工具条上视为会话仍在进行，否则点一下工具条就会把它自己隐藏掉。
+WaitDialogSessionEnd(WinID) {
+	global G_BarHwnd
+	Loop {
+		if (WinActive("ahk_id " WinID)) {
+			Sleep 30
+			continue
+		}
+		; 焦点落在工具条上时视为会话仍在进行，
+		; 但需同时确认对话框还在，否则会因工具条仍在前台而永远等不到结束
+		if (G_BarHwnd && WinActive("ahk_id " G_BarHwnd) && DllCall("IsWindow", "Ptr", WinID)) {
+			Sleep 30
+			continue
+		}
+		return
+	}
+}
+
+; SetWinEventHook 回调：仅处理当前文件对话框自身(OBJID_WINDOW)的位置/尺寸变化
+WinEventProc(hHook, event, hwnd, idObject, idChild, dwEventThread, dwmsEventTime) {
+	global G_DlgHwnd, G_BarHwnd
+	if (event == EVENT_OBJECT_LOCATIONCHANGE && idObject == OBJID_WINDOW && hwnd == G_DlgHwnd && G_BarHwnd) {
+		RepositionBar(hwnd)
+	}
+}
+
+OnSearchInput(GuiCtrlObj, Info) {
+	global G_SearchText
+	G_SearchText := GuiCtrlObj.Text
+	; 未来在此根据 G_SearchText 查询文件
+}
+
+; 隐藏默认按钮的 Click：搜索框中按 Enter 时触发（未来接文件查询）
+OnSearchSubmit(GuiCtrlObj, Info) {
+	global G_SearchText
+	ToolTip("待实现查询: " G_SearchText)
+	SetTimer(() => ToolTip(), -1500)
 }
 
 ; 严重目录是否正确
@@ -356,12 +443,13 @@ FeedDialog_GENERAL(_WinID, _NewPath) {
 	; 获取文件名输入框控件
 	_edit := ControlGetHwnd("Edit1", _WinID)
 	If (!_edit) {
-		MsgBox "This type of dialog can not be handled (yet).`nPlease report it!"
+		MsgBox "This type of dialog can not be handled (yet).`nPlease report it!1"
 		Return
 	}
+	Sleep(100) ; 等待控件稳定，某些情况下控件可能还未完全创建
 	_addr_edit := FindChildByXPath("WorkerW/ReBarWindow32/Address Band Root/msctls_progress32/ComboBoxEx32/ComboBox/Edit", _WinID)
 	If (!_addr_edit) {
-		MsgBox "This type of dialog can not be handled (yet).`nPlease report it!"
+		MsgBox "This type of dialog can not be handled (yet).`nPlease report it!2"
 		Return
 	}
 	_NewPath := RTrim(_NewPath, "\") "\"
