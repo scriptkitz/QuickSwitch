@@ -184,25 +184,28 @@ RepositionBar(_WinID) {
 		_w := 200
 	; 工具条窗：贴在对话框下边缘外侧，宽度与对话框一致，用 SWP_NOZORDER 保持 AlwaysOnTop 层位
 	DllCall("SetWindowPos", "Ptr", G_BarHwnd, "Ptr", 0, "Int", _l, "Int", _b, "Int", _w, "Int", BAR_H, "UInt", SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOSENDCHANGING, "Int")
-	; 行高取 ComboBox 的可见高度(CB_GETITEMHEIGHT -1 = 选择区高度)，让 ⚙ 与 ComboBox 严格同高同顶、垂直居中
-	_row_h := 24
+	; ComboBox 可见行高(CB_GETITEMHEIGHT -1)，仅用于让 ComboBox 垂直居中
+	_row_h := 22
 	if (G_ComboHwnd && DllCall("IsWindow", "Ptr", G_ComboHwnd)) {
 		_eh := DllCall("SendMessage", "Ptr", G_ComboHwnd, "UInt", 0x0154, "Ptr", -1, "Ptr", 0, "Ptr")
-		if (_eh > 10)
+		if (_eh >= 16 && _eh <= BAR_H - 4)
 			_row_h := _eh
 	}
-	_ry := (BAR_H - _row_h) // 2
+	; ⚙ 按钮固定高度(不被压扁)；两者各自垂直居中 => 中心轴一致即视觉对齐
+	_btn_h := BAR_H - 6
+	_cy := (BAR_H - _row_h) // 2
+	_by := (BAR_H - _btn_h) // 2
 	; ComboBox：占满左侧（只改宽度与纵向位置，高度沿用创建值，避免破坏下拉列表高度）
 	if (G_ComboHwnd && DllCall("IsWindow", "Ptr", G_ComboHwnd)) {
 		_crect := Buffer(16)
 		DllCall("GetWindowRect", "Ptr", G_ComboHwnd, "Ptr", _crect)
 		_chh := NumGet(_crect, 12, "Int") - NumGet(_crect, 4, "Int")
 		_cw := _w - 8 - BAR_BTN_W - BAR_GAP
-		DllCall("SetWindowPos", "Ptr", G_ComboHwnd, "Ptr", 0, "Int", 4, "Int", _ry, "Int", _cw, "Int", _chh, "UInt", SWP_NOZORDER | SWP_NOACTIVATE, "Int")
+		DllCall("SetWindowPos", "Ptr", G_ComboHwnd, "Ptr", 0, "Int", 4, "Int", _cy, "Int", _cw, "Int", _chh, "UInt", SWP_NOZORDER | SWP_NOACTIVATE, "Int")
 	}
-	; ⚙ 按钮：右侧，与 ComboBox 同顶同高
+	; ⚙ 按钮：右侧，固定高度，与 ComboBox 中心轴对齐
 	if (G_BarBtnHwnd && DllCall("IsWindow", "Ptr", G_BarBtnHwnd))
-		DllCall("SetWindowPos", "Ptr", G_BarBtnHwnd, "Ptr", 0, "Int", _w - 4 - BAR_BTN_W, "Int", _ry, "Int", BAR_BTN_W, "Int", _row_h, "UInt", SWP_NOZORDER | SWP_NOACTIVATE, "Int")
+		DllCall("SetWindowPos", "Ptr", G_BarBtnHwnd, "Ptr", 0, "Int", _w - 4 - BAR_BTN_W, "Int", _by, "Int", BAR_BTN_W, "Int", _btn_h, "UInt", SWP_NOZORDER | SWP_NOACTIVATE, "Int")
 }
 
 ; 等待"对话框会话"结束：对话框被销毁，或对话框与工具条都不再是前台窗口。
