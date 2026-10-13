@@ -755,30 +755,68 @@ FeedDialog_GENERAL(_WinID, _NewPath, _safe := False) {
 
 	try WinActivate(_WinID)
 
-	; 先激活文件列表区，地址栏的 ComboBox 才收得到我们写进去的文本（实测必要）
-	try
-		ControlFocus("DirectUIHWND2", "ahk_id " _WinID)
-	catch
-		try ControlFocus("DirectUIHWND1", "ahk_id " _WinID)
+	; —— 关键：让焦点离开"文件夹/文件名"输入框(Edit1) ——
+	; 回车若被对话框的消息循环吃掉，会落到**当前焦点控件**上；而文件夹对话框里
+	; Edit1 就是"文件夹"框，回车 = 确定 → 对话框被直接确认（文件对话框的 Edit1 是
+	; 文件名框、通常为空，所以只是无事发生，看起来"正常"）。
+	; 实测 ControlFocus 对地址栏无效、对文件列表有效，所以聚焦文件列表并校验。
+	_focusOK := FocusFileList(_WinID)
 	Sleep(50)
 
 	; —— 导航：写地址栏 + 给地址栏发回车 ——
 	; 实测（自建"选择文件夹"对话框复现，用 WinGetText 判定是否真导航）：
 	;   * ControlFocus 无法把焦点交给地址栏；Alt+D 会重置地址栏文本 → 两者都让导航失效；
 	;   * 唯一有效的是下面这段：回车由地址栏自己消费，只做导航。
-	;   * 回车后把焦点还给文件列表：万一有残留回车，也只会落到列表而非对话框默认按钮。
 	try {
 		ControlSetText(_NewPath, _addr_edit, _WinID)
 		Sleep(50)
+		if (_safe && !_focusOK)
+			return              ; 焦点没能离开 Edit1 → 宁可不导航，也不冒"被确定"的风险
 		ControlSend("{Enter}", _addr_edit, _WinID)
-		if (_safe) {
-			Sleep(120)
-			try ControlFocus("DirectUIHWND2", "ahk_id " _WinID)
-			catch
-				try ControlFocus("DirectUIHWND1", "ahk_id " _WinID)
-		}
+		Sleep(120)
+		FocusFileList(_WinID, 2)    ; 回车后也把焦点收回列表，兜住滞留的回车
 	}
 	Sleep(10)
+}
+
+; 把键盘焦点移到对话框的文件列表上，并**校验**确实移到了（返回 True = 焦点不在 Edit1 上）。
+; 为什么要校验：回车一旦落到 Edit1（文件夹框）就等于"确定"。
+FocusFileList(_WinID, tries := 4) {
+	global G_FDType
+	Loop tries {
+		try
+			ControlFocus("DirectUIHWND2", "ahk_id " _WinID)
+		catch
+			try ControlFocus("DirectUIHWND1", "ahk_id " _WinID)
+		Sleep 40
+		if (GetFocusedCtrlHwnd(_WinID) = FileListHwnd(_WinID))
+			return True
+		try WinActivate("ahk_id " _WinID)
+		Sleep 60
+	}
+	return False
+}
+
+; 文件列表控件的 hwnd（现代对话框是 DirectUIHWND2/1，老样式是 SysListView321）
+FileListHwnd(_WinID) {
+	for cls in ["DirectUIHWND2", "DirectUIHWND1", "SysListView321"] {
+		try {
+			hwnd := ControlGetHwnd(cls, "ahk_id " _WinID)
+			if (hwnd)
+				return hwnd
+		}
+	}
+	return 0
+}
+
+; 取对话框里当前拥有键盘焦点的控件 hwnd（取不到返回 0）
+GetFocusedCtrlHwnd(_WinID) {
+	try {
+		cls := ControlGetFocus("ahk_id " _WinID)
+		if (cls)
+			return ControlGetHwnd(cls, _WinID)
+	}
+	return 0
 }
 
 ; 按 "类名/类名/..." 逐层查找子控件，返回其 hwnd（找不到返回 0）
