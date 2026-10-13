@@ -40,11 +40,14 @@ WM_UPDATEUISTATE := 0x0128
 BAR_H := 30
 BAR_BTN_W := 32
 BAR_GAP := 4
+COMBO_PATH_PREFIX := "📁 "   ; 下拉里"最近文件夹路径"项的前缀，用于区分选中项类型
 
 G_DlgHwnd := 0
 G_LastSetDlg := 0 ; 最后一次自动切换路径的对话框
 G_Menu := Menu()
+G_Combo := 0             ; ComboBox 控件对象(用于增删下拉项)
 G_ComboHwnd := 0
+G_ComboPaths := []       ; 下拉里"路径项"的路径数组(与项索引一一对应)
 G_BarBtnHwnd := 0
 ; 预计算的布局常量（在 CreateBarWnd 里填；重定位时不再重复测量）
 G_ComboWinH := 0
@@ -54,6 +57,14 @@ G_BarChildW := -1   ; 子控件上次按多宽排过版
 G_BarGui := CreateBarWnd()
 G_BarHwnd := G_BarGui.Hwnd
 G_SearchText := ""
+; 设置项
+G_bEnableBar := G_IniConfig.ReadSetting("enable_bar", 1) ? True : False
+G_bDefaultAutoSwitch := G_IniConfig.ReadSetting("default_autoswitch", 1) ? True : False
+G_PrefGui := 0
+G_PrefBar := 0
+G_PrefAutoRun := 0
+G_PrefAutoSw := 0
+G_PrefMax := 0
 ; 窗口事件钩子：不全局注册，而是在检测到对话框时按"对话框所在线程"注册，
 ; 只接收该线程的事件，大幅减少无关进程的唤醒开销（WINEVENT_OUTOFCONTEXT = flags 0）。
 G_WinEventProc := CallbackCreate(WinEventProc, "Fast", 7)
@@ -67,24 +78,20 @@ Loop {
 	_G_FDType := GetFileDialogType(WinID)
 	if (_G_FDType) {
 		G_DlgHwnd := WinID
+		windows_title := WinGetTitle(WinID)
+		windows_exe := WinGetProcessName(WinID)
+		_G_DialogFinger := windows_exe . "___" . windows_title
 		ShowBar(WinID)
 		; 激活的窗口在失去激活前只能自动设置一次路径。
 		if (G_LastSetDlg = G_DlgHwnd) { 
 			Continue
 		}
-		windows_title := WinGetTitle(WinID)
-		windows_exe := WinGetProcessName(WinID)
-		_G_DialogFinger := windows_exe . "___" . windows_title
-		
 		_bAuto := G_IniConfig.ReadDialogNode(_G_DialogFinger)
-		if (_bAuto || _bAuto == "") {
-			_G_bAutoSwitch := True
-		} else {
-			_G_bAutoSwitch := False
+		if (_bAuto == "") {
+			_bAuto := G_bDefaultAutoSwitch ? 1 : 0
+			G_IniConfig.WriteDialogNode(_G_DialogFinger, _bAuto)
 		}
-		if(_bAuto == "") {
-			G_IniConfig.WriteDialogNode(_G_DialogFinger)
-		}
+		_G_bAutoSwitch := _bAuto ? True : False
 		FolderPath := GetZWindowPath(WinID)
 		if (_G_bAutoSwitch && ValidFolder(FolderPath)) {
 			FeedDialog(WinID, FolderPath)
@@ -106,23 +113,22 @@ MAKELONG(LOWORD,HIWORD,Hex:=0){
 OnBtnSetting(Obj, info) {
 	global G_BarHwnd
 	AUTOSWITCH := "自动切换"
+	PREFS := "首选项"
 	OnMenuPath(_name, _pos, _menu) {
 		if (AUTOSWITCH = _name) {
 			_menu.ToggleCheck(_name)
 			G_IniConfig.WriteDialogNode(_G_DialogFinger, !_G_bAutoSwitch)
-		} else {
-			FeedDialog(G_DlgHwnd, _name)
+		} else if (PREFS = _name) {
+			; 用一次性定时器推迟到菜单关闭后再弹窗
+			SetTimer(ShowPreferences, -10)
 		}
 	}
 	MouseGetPos &x, &y
 	G_Menu.Delete()
 	G_Menu.Add(AUTOSWITCH, OnMenuPath)
 	_G_bAutoSwitch ? G_Menu.Check(AUTOSWITCH) : G_Menu.UnCheck(AUTOSWITCH)
-	paths := G_IniConfig.ReadDialogPaths(_G_DialogFinger)
-
-	for idx, p in paths {
-		G_Menu.Add(p, OnMenuPath)
-	}
+	G_Menu.Add()   ; 分隔线
+	G_Menu.Add(PREFS, OnMenuPath)
 	ControlGetPos &cx, &cy, &cw, &ch, Obj
 
 	; 菜单挂到工具条窗口下，显示在 ⚙ 按钮正下方
@@ -137,12 +143,14 @@ OnBtnSetting(Obj, info) {
 CreateBarWnd() {
 	global G_ComboHwnd, G_BarBtnHwnd, BAR_H, BAR_BTN_W
 	global G_ComboWinH, G_ComboY, G_BtnY
+	global G_Combo
 	_gui := Gui("+ToolWindow -Caption +AlwaysOnTop")
 	_gui.MarginX := 4
 	_gui.MarginY := 3
 	_gui.BackColor := "F2F2F2"
 	; ComboBox：以后用 Add()/Delete() 放输入历史，可下拉选择（h200 为下拉列表高度）
 	_combo := _gui.AddComboBox("w280 h200", [])
+	G_Combo := _combo
 	G_ComboHwnd := _combo.Hwnd
 	_combo.OnEvent("Change", OnSearchInput)
 	; ⚙ 按钮（位置/尺寸由 RepositionBar 统一布局；未来承载菜单/配置）
@@ -167,11 +175,12 @@ CreateBarWnd() {
 
 ; 显示底部工具条，并把位置钩子限定到该对话框所在线程。
 ShowBar(_WinID) {
-	global G_BarGui, G_BarHwnd, G_BarChildW
-	if (!G_BarGui)
+	global G_BarGui, G_BarHwnd, G_BarChildW, G_bEnableBar
+	if (!G_BarGui || !G_bEnableBar)
 		return
 	G_BarHwnd := G_BarGui.Hwnd
 	G_BarChildW := -1          ; 强制重新排布子控件
+	RefreshComboItems(True)    ; 按当前对话框重建下拉：最近文件夹路径 + 搜索关键词历史
 	HookDialogThread(_WinID)
 	RepositionBar(_WinID)
 }
@@ -182,6 +191,27 @@ HideBar() {
 	if (G_BarHwnd && DllCall("IsWindow", "Ptr", G_BarHwnd))
 		DllCall("SetWindowPos", "Ptr", G_BarHwnd, "Ptr", 0, "Int", 0, "Int", 0, "Int", 0, "Int", 0, "UInt", SWP_HIDEWINDOW | SWP_NOACTIVATE, "Int")
 	G_BarHwnd := 0
+}
+
+; 重建 ComboBox 下拉项：先"最近文件夹路径"(📁 前缀)，再"搜索关键词历史"。
+; clearText=True 时同时清空输入框（新对话框会话开始时用）。
+RefreshComboItems(clearText := False) {
+	global G_Combo, G_ComboPaths, G_IniConfig, _G_DialogFinger
+	if (!G_Combo)
+		return
+	paths := G_IniConfig.ReadDialogPaths(_G_DialogFinger)
+	kws := G_IniConfig.ReadSearchHistory()
+	G_ComboPaths := paths
+	items := []
+	for p in paths
+		items.Push(COMBO_PATH_PREFIX . p)
+	for k in kws
+		items.Push(k)
+	G_Combo.Delete()
+	if (items.Length)
+		G_Combo.Add(items)
+	if (clearText)
+		G_Combo.Text := ""
 }
 
 ; 只监听指定窗口所属线程的位置/尺寸事件（跨进程用 out-of-context 钩子）。
@@ -231,14 +261,25 @@ RepositionBar(_WinID) {
 ; 等待"对话框会话"结束。用 WinWaitNotActive（AHK 内置的前台等待，开销极低）代替 30ms 轮询；
 ; 仅当焦点落在工具条上时才短暂轮询，避免因工具条持有焦点而误判会话未结束。
 WaitDialogSessionEnd(WinID) {
-	global G_BarHwnd
+	global G_BarHwnd, G_PrefGui
 	Loop {
 		WinWaitNotActive(WinID)
 		if (!DllCall("IsWindow", "Ptr", WinID))
 			return
-		if (!(G_BarHwnd && WinActive("ahk_id " G_BarHwnd)))
-			return
-		Sleep 30
+		if (G_BarHwnd && WinActive("ahk_id " G_BarHwnd)) {
+			Sleep 30
+			continue
+		}
+		; 首选项对话框打开时也算会话进行中，避免工具条被隐藏
+		if (G_PrefGui) {
+			try {
+				if (WinActive("ahk_id " G_PrefGui.Hwnd)) {
+					Sleep 30
+					continue
+				}
+			}
+		}
+		return
 	}
 }
 
@@ -250,15 +291,35 @@ WinEventProc(hHook, event, hwnd, idObject, idChild, dwEventThread, dwmsEventTime
 	}
 }
 
+; ComboBox Change：打字或从下拉里选择都会触发
 OnSearchInput(GuiCtrlObj, Info) {
-	global G_SearchText
-	G_SearchText := GuiCtrlObj.Text
-	; 未来在此根据 G_SearchText 查询文件
+	global G_SearchText, G_DlgHwnd
+	t := GuiCtrlObj.Text
+	; 选中的是"最近文件夹路径"项 → 让文件对话框切换到该文件夹，并清空搜索框
+	if (t != "" && SubStr(t, 1, StrLen(COMBO_PATH_PREFIX)) = COMBO_PATH_PREFIX) {
+		p := Trim(SubStr(t, StrLen(COMBO_PATH_PREFIX) + 1))
+		if (ValidFolder(p)) {
+			FeedDialog(G_DlgHwnd, p)
+			G_SearchText := ""
+			GuiCtrlObj.Text := ""
+			return
+		}
+	}
+	G_SearchText := t
 }
 
-; 隐藏默认按钮的 Click：搜索框中按 Enter 时触发（未来接文件查询）
+; 隐藏默认按钮的 Click：搜索框中按 Enter 时触发
 OnSearchSubmit(GuiCtrlObj, Info) {
-	global G_SearchText
+	global G_SearchText, G_IniConfig, G_Combo
+	q := Trim(G_SearchText)
+	; 记录搜索关键词历史（路径项除外），并刷新下拉
+	if (q != "" && SubStr(q, 1, StrLen(COMBO_PATH_PREFIX)) != COMBO_PATH_PREFIX) {
+		G_IniConfig.AddSearchHistory(q)
+		RefreshComboItems(False)
+		if (G_Combo)
+			G_Combo.Text := q     ; 重建下拉可能清掉文本，恢复一下
+	}
+	; 未来：在此根据 G_SearchText 执行文件查询
 	ToolTip("待实现查询: " G_SearchText)
 	SetTimer(() => ToolTip(), -1500)
 }
@@ -498,6 +559,98 @@ FeedDialog_GENERAL(_WinID, _NewPath) {
 	Sleep(10)
 }
 
+; ===== 首选项对话框 =====
+; 已实现：启用工具条 / 随系统启动 / 默认自动切换 / 历史条数 / 清空历史 / 打开配置文件
+; 规划中（待接）：工具条外观(高度/按钮宽)、自动切换延迟、按进程黑名单、
+;                 支持的文件管理器开关(Explorer/TC/XYPlorer/DOpus/Tablacus)、呼出快捷键、配置导入导出/重置
+ShowPreferences() {
+	global G_PrefGui, G_PrefBar, G_PrefAutoRun, G_PrefAutoSw, G_PrefMax
+	global G_IniConfig, G_bEnableBar, G_bDefaultAutoSwitch
+	if (!G_PrefGui) {
+		_g := Gui("+AlwaysOnTop", "QuickSwitch 首选项")
+		_g.MarginX := 14
+		_g.MarginY := 12
+		_g.SetFont("s9")
+
+		_g.AddText("xm w320", "通用")
+		G_PrefBar := _g.AddCheckBox("xm+14 y+6", "启用底部搜索工具条")
+		G_PrefAutoRun := _g.AddCheckBox("xm+14 y+4", "随系统启动")
+
+		_g.AddText("xm y+12 w320", "自动切换")
+		G_PrefAutoSw := _g.AddCheckBox("xm+14 y+6", "新对话框默认开启自动切换")
+
+		_g.AddText("xm y+12 w320", "搜索与历史")
+		_g.AddText("xm+14 y+8", "最多保留历史条数：")
+		G_PrefMax := _g.AddEdit("x+6 yp-2 w60 Number")
+
+		_g.AddText("xm y+14 w320", "其他")
+		_g.AddButton("xm+14 y+6 w120", "打开配置文件").OnEvent("Click", OnPrefsOpenIni)
+		_g.AddButton("x+10 w120", "清空搜索历史").OnEvent("Click", OnPrefsClearHistory)
+
+		_g.AddButton("xm+90 y+20 w80 Default", "确定").OnEvent("Click", OnPrefsOK)
+		_g.AddButton("x+10 w80", "取消").OnEvent("Click", OnPrefsCancel)
+
+		G_PrefGui := _g
+	}
+	; 每次打开都按当前设置刷新控件状态
+	G_PrefBar.Value := G_bEnableBar ? 1 : 0
+	G_PrefAutoSw.Value := G_bDefaultAutoSwitch ? 1 : 0
+	G_PrefMax.Value := G_IniConfig.ReadSetting("history_max", 20)
+	G_PrefAutoRun.Value := IsAutoRun() ? 1 : 0
+	G_PrefGui.Show()
+}
+
+OnPrefsOK(GuiCtrlObj, Info) {
+	global G_PrefGui, G_PrefBar, G_PrefAutoRun, G_PrefAutoSw, G_PrefMax
+	global G_IniConfig, G_bEnableBar, G_bDefaultAutoSwitch
+	G_bEnableBar := (G_PrefBar.Value = 1)
+	G_bDefaultAutoSwitch := (G_PrefAutoSw.Value = 1)
+	n := G_PrefMax.Value + 0
+	if (n < 1)
+		n := 20
+	G_PrefMax.Value := n
+	G_IniConfig.WriteSetting("enable_bar", G_bEnableBar ? 1 : 0)
+	G_IniConfig.WriteSetting("default_autoswitch", G_bDefaultAutoSwitch ? 1 : 0)
+	G_IniConfig.WriteSetting("history_max", n)
+	SetAutoRun(G_PrefAutoRun.Value = 1)
+	G_PrefGui.Hide()
+}
+
+OnPrefsCancel(GuiCtrlObj, Info) {
+	global G_PrefGui
+	G_PrefGui.Hide()
+}
+
+OnPrefsClearHistory(GuiCtrlObj, Info) {
+	global G_IniConfig
+	G_IniConfig.ClearSearchHistory()
+	RefreshComboItems(False)
+	ToolTip("已清空搜索历史")
+	SetTimer(() => ToolTip(), -1200)
+}
+
+OnPrefsOpenIni(GuiCtrlObj, Info) {
+	Run('notepad.exe "' . A_ScriptDir . '\config.ini"')
+}
+
+; 是否已设置开机自启（HKCU\...\Run）
+IsAutoRun() {
+	try
+		return RegRead("HKCU\Software\Microsoft\Windows\CurrentVersion\Run", "QuickSwitch") != ""
+	catch
+		return False
+}
+
+SetAutoRun(enable) {
+	key := "HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
+	if (enable) {
+		cmd := A_IsCompiled ? Format('"{1}"', A_ScriptFullPath) : Format('"{1}" "{2}"', A_AhkPath, A_ScriptFullPath)
+		RegWrite(cmd, "REG_SZ", key, "QuickSwitch")
+	} else {
+		try RegDelete(key, "QuickSwitch")
+	}
+}
+
 ; Ini
 Class IniConfig {
 	_filename := ""
@@ -549,6 +702,52 @@ Class IniConfig {
 				_s := _s . "|" . p 
 		}
 		IniWrite _s, this._filename, DialogStr, "paths"
+	}
+
+	; —— [Settings] 通用设置 ——
+	ReadSetting(Key, Default := "") {
+		return IniRead(this._filename, "Settings", Key, Default)
+	}
+	WriteSetting(Key, Value) {
+		IniWrite Value, this._filename, "Settings", Key
+	}
+
+	; —— [Search] 搜索关键词历史 ——
+	ReadSearchHistory() {
+		arr := []
+		s := IniRead(this._filename, "Search", "history", "")
+		if (s != "")
+			arr := StrSplit(s, "|")
+		return arr
+	}
+	WriteSearchHistory(arr) {
+		s := ""
+		for v in arr
+			s := (s = "") ? v : s . "|" . v
+		IniWrite s, this._filename, "Search", "history"
+	}
+	; 新增一条历史(去重、置顶、按 history_max 截断)
+	AddSearchHistory(q) {
+		q := Trim(q)
+		if (q = "")
+			return
+		arr := this.ReadSearchHistory()
+		Loop arr.Length {
+			if (arr[A_Index] = q) {
+				arr.RemoveAt(A_Index)
+				Break
+			}
+		}
+		arr.InsertAt(1, q)
+		n := this.ReadSetting("history_max", 20) + 0
+		if (n < 1)
+			n := 20
+		while (arr.Length > n)
+			arr.Pop()
+		this.WriteSearchHistory(arr)
+	}
+	ClearSearchHistory() {
+		this.WriteSearchHistory([])
 	}
 
 }
