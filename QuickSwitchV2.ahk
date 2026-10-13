@@ -41,6 +41,7 @@ BAR_H := 30
 BAR_BTN_W := 32
 BAR_GAP := 4
 COMBO_PATH_PREFIX := "📁 "   ; 下拉里"最近文件夹路径"项的前缀，用于区分选中项类型
+INVALID_TEXT := "无效路径"    ; 输入非法路径时在搜索框里显示的红色提示
 
 G_DlgHwnd := 0
 G_LastSetDlg := 0 ; 最后一次自动切换路径的对话框
@@ -193,7 +194,7 @@ HideBar() {
 	G_BarHwnd := 0
 }
 
-; 重建 ComboBox 下拉项：先"最近文件夹路径"(📁 前缀)，再"搜索关键词历史"。
+; 重建 ComboBox 下拉项：先"最近文件夹路径"(📁 前缀)，再"输入历史"。
 ; clearText=True 时同时清空输入框（新对话框会话开始时用）。
 RefreshComboItems(clearText := False) {
 	global G_Combo, G_ComboPaths, G_IniConfig, _G_DialogFinger
@@ -308,20 +309,81 @@ OnSearchInput(GuiCtrlObj, Info) {
 	G_SearchText := t
 }
 
-; 隐藏默认按钮的 Click：搜索框中按 Enter 时触发
+; 隐藏默认按钮的 Click：搜索框中按 Enter 时触发。
+; 输入按"路径"处理：目录 → 直接跳转；文件 → 跳到所在目录并填好文件名；
+; 无效 → 搜索框红字提示 + 系统错误提示音。
 OnSearchSubmit(GuiCtrlObj, Info) {
-	global G_SearchText, G_IniConfig, G_Combo
+	global G_SearchText, G_IniConfig, G_Combo, G_DlgHwnd
 	q := Trim(G_SearchText)
-	; 记录搜索关键词历史（路径项除外），并刷新下拉
-	if (q != "" && SubStr(q, 1, StrLen(COMBO_PATH_PREFIX)) != COMBO_PATH_PREFIX) {
-		G_IniConfig.AddSearchHistory(q)
-		RefreshComboItems(False)
-		if (G_Combo)
-			G_Combo.Text := q     ; 重建下拉可能清掉文本，恢复一下
+	; 忽略：空输入、下拉里的"路径项"(选中时已处理)、我们自己的红字提示
+	if (q = "" || q = INVALID_TEXT)
+		return
+	if (SubStr(q, 1, StrLen(COMBO_PATH_PREFIX)) = COMBO_PATH_PREFIX)
+		return
+	p := ExpandPath(q)
+	attr := FileExist(p)
+	if (attr = "") {
+		ShowInvalidPath()
+		return
 	}
-	; 未来：在此根据 G_SearchText 执行文件查询
-	ToolTip("待实现查询: " G_SearchText)
-	SetTimer(() => ToolTip(), -1500)
+	if (InStr(attr, "D")) {
+		FeedDialog(G_DlgHwnd, p)              ; 目录：直接跳转
+	} else {
+		SplitPath(p, &_name, &_dir)           ; 文件：先跳到所在目录
+		FeedDialog(G_DlgHwnd, _dir)
+		Sleep 120
+		SetDlgFileName(G_DlgHwnd, _name)      ; 再把文件名填进"文件名"框（≈选中该文件）
+	}
+	; 记住这次输入并刷新下拉，然后清空搜索框
+	G_IniConfig.AddSearchHistory(q)
+	RefreshComboItems(False)
+	if (G_Combo) {
+		G_Combo.Text := ""
+		G_SearchText := ""
+	}
+}
+
+; 展开 %环境变量% 并去掉首尾成对引号
+ExpandPath(s) {
+	s := Trim(s)
+	len := StrLen(s)
+	if (len >= 2 && ((SubStr(s, 1, 1) = '"' && SubStr(s, len) = '"') || (SubStr(s, 1, 1) = "'" && SubStr(s, len) = "'")))
+		s := SubStr(s, 2, len - 2)
+	if (InStr(s, "%")) {
+		buf := Buffer(65536)
+		if (DllCall("ExpandEnvironmentStringsW", "WStr", s, "Ptr", buf, "UInt", 32767))
+			s := StrGet(buf)
+	}
+	return s
+}
+
+; 把文件名填进公共对话框的"文件名"输入框(Edit1)
+SetDlgFileName(_WinID, name) {
+	_edit := ControlGetHwnd("Edit1", _WinID)
+	if (!_edit)
+		return
+	ControlSetText(name, "ahk_id " _edit)
+}
+
+; 无效路径：搜索框红字提示 + 系统错误提示音，1.5 秒后自动恢复
+ShowInvalidPath() {
+	global G_Combo, G_SearchText
+	if (!G_Combo)
+		return
+	try G_Combo.SetFont("cRed")
+	G_Combo.Text := INVALID_TEXT
+	G_SearchText := ""
+	DllCall("MessageBeep", "UInt", 0x10)   ; MB_ICONHAND：系统"错误"提示音
+	SetTimer(ClearInvalidPath, -1500)
+}
+
+ClearInvalidPath() {
+	global G_Combo
+	if (!G_Combo)
+		return
+	try G_Combo.SetFont("cDefault")
+	if (G_Combo.Text = INVALID_TEXT)
+		G_Combo.Text := ""
 }
 
 ; 严重目录是否正确
