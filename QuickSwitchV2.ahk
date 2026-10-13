@@ -46,13 +46,18 @@ G_LastSetDlg := 0 ; 最后一次自动切换路径的对话框
 G_Menu := Menu()
 G_ComboHwnd := 0
 G_BarBtnHwnd := 0
+; 预计算的布局常量（在 CreateBarWnd 里填；重定位时不再重复测量）
+G_ComboWinH := 0
+G_ComboY := 3
+G_BtnY := 3
+G_BarChildW := -1   ; 子控件上次按多宽排过版
 G_BarGui := CreateBarWnd()
 G_BarHwnd := G_BarGui.Hwnd
 G_SearchText := ""
-; 注册全局窗口事件钩子：监听文件对话框自身的位置/尺寸变化，同步搜索框位置。
-; 用 WINEVENT_OUTOFCONTEXT(默认 flags=0) 以便跨进程捕获其它程序的对话框事件。
+; 窗口事件钩子：不全局注册，而是在检测到对话框时按"对话框所在线程"注册，
+; 只接收该线程的事件，大幅减少无关进程的唤醒开销（WINEVENT_OUTOFCONTEXT = flags 0）。
 G_WinEventProc := CallbackCreate(WinEventProc, "Fast", 7)
-G_WinEventHook := DllCall("SetWinEventHook", "UInt", EVENT_OBJECT_LOCATIONCHANGE, "UInt", EVENT_OBJECT_LOCATIONCHANGE, "Ptr", 0, "Ptr", G_WinEventProc, "UInt", 0, "UInt", 0, "UInt", 0, "Ptr")
+G_WinEventHook := 0
 _G_DialogFinger := ""
 _G_FDType := ""
 _G_bAutoSwitch := True
@@ -130,7 +135,8 @@ OnBtnSetting(Obj, info) {
 
 ; ===== 底部工具条（单一父窗口）：[ ComboBox ] [ ⚙ ]，跟随系统文件对话框显示与移动 =====
 CreateBarWnd() {
-	global G_ComboHwnd, G_BarBtnHwnd
+	global G_ComboHwnd, G_BarBtnHwnd, BAR_H, BAR_BTN_W
+	global G_ComboWinH, G_ComboY, G_BtnY
 	_gui := Gui("+ToolWindow -Caption +AlwaysOnTop")
 	_gui.MarginX := 4
 	_gui.MarginY := 3
@@ -146,84 +152,93 @@ CreateBarWnd() {
 	; 隐藏默认按钮：捕获 Enter（ComboBox 没有 KeyDown 事件）
 	_hbtn := _gui.AddButton("Default Hidden w1 h1", "")
 	_hbtn.OnEvent("Click", OnSearchSubmit)
+
+	; —— 预计算布局常量：只测一次，之后每次重定位不再 GetWindowRect/SendMessage ——
+	_r := Buffer(16)
+	DllCall("GetWindowRect", "Ptr", G_ComboHwnd, "Ptr", _r)
+	G_ComboWinH := NumGet(_r, 12, "Int") - NumGet(_r, 4, "Int")   ; ComboBox 窗口总高(含下拉区)
+	_vh := DllCall("SendMessage", "Ptr", G_ComboHwnd, "UInt", 0x0154, "Ptr", -1, "Ptr", 0, "Ptr")  ; 选择区可见高度
+	if (!(_vh >= 16 && _vh <= BAR_H - 4))
+		_vh := 22
+	G_ComboY := (BAR_H - _vh) // 2
+	G_BtnY := (BAR_H - (BAR_H - 6)) // 2
 	return _gui
 }
 
-; 显示底部工具条。
+; 显示底部工具条，并把位置钩子限定到该对话框所在线程。
 ShowBar(_WinID) {
-	global G_BarGui, G_BarHwnd
+	global G_BarGui, G_BarHwnd, G_BarChildW
 	if (!G_BarGui)
 		return
 	G_BarHwnd := G_BarGui.Hwnd
+	G_BarChildW := -1          ; 强制重新排布子控件
+	HookDialogThread(_WinID)
 	RepositionBar(_WinID)
 }
 
 HideBar() {
 	global G_BarHwnd
+	UnhookDialogThread()
 	if (G_BarHwnd && DllCall("IsWindow", "Ptr", G_BarHwnd))
 		DllCall("SetWindowPos", "Ptr", G_BarHwnd, "Ptr", 0, "Int", 0, "Int", 0, "Int", 0, "Int", 0, "UInt", SWP_HIDEWINDOW | SWP_NOACTIVATE, "Int")
 	G_BarHwnd := 0
+}
+
+; 只监听指定窗口所属线程的位置/尺寸事件（跨进程用 out-of-context 钩子）。
+HookDialogThread(winID) {
+	global G_WinEventHook, G_WinEventProc, EVENT_OBJECT_LOCATIONCHANGE
+	if (G_WinEventHook)
+		DllCall("UnhookWinEvent", "Ptr", G_WinEventHook)
+	tid := DllCall("GetWindowThreadProcessId", "Ptr", winID, "Ptr", 0, "UInt")
+	G_WinEventHook := DllCall("SetWinEventHook", "UInt", EVENT_OBJECT_LOCATIONCHANGE, "UInt", EVENT_OBJECT_LOCATIONCHANGE, "Ptr", 0, "Ptr", G_WinEventProc, "UInt", 0, "UInt", tid, "UInt", 0, "Ptr")
+}
+
+UnhookDialogThread() {
+	global G_WinEventHook
+	if (G_WinEventHook) {
+		DllCall("UnhookWinEvent", "Ptr", G_WinEventHook)
+		G_WinEventHook := 0
+	}
 }
 
 ; 把工具条贴到对话框下边缘外侧（屏幕坐标），并排好内部 [ ComboBox | ⚙ ]。
 ; 可被 Fast 回调直接调用：只用 DllCall/Buffer/NumGet。
 RepositionBar(_WinID) {
 	global G_BarHwnd, G_ComboHwnd, G_BarBtnHwnd, BAR_H, BAR_BTN_W, BAR_GAP
+	global G_ComboWinH, G_ComboY, G_BtnY, G_BarChildW
+	static _r := Buffer(16)
 	if (!G_BarHwnd)
 		return
-	if (!DllCall("IsWindow", "Ptr", _WinID))
+	; 对话框已销毁时 GetWindowRect 失败 → 直接返回，省掉一次 IsWindow
+	if (!DllCall("GetWindowRect", "Ptr", _WinID, "Ptr", _r))
 		return
-	_rect := Buffer(16)
-	if (!DllCall("GetWindowRect", "Ptr", _WinID, "Ptr", _rect))
-		return
-	_l := NumGet(_rect, 0, "Int")
-	_r := NumGet(_rect, 8, "Int")
-	_b := NumGet(_rect, 12, "Int")
-	_w := _r - _l
+	_l := NumGet(_r, 0, "Int")
+	_rt := NumGet(_r, 8, "Int")
+	_b := NumGet(_r, 12, "Int")
+	_w := _rt - _l
 	if (_w < 200)
 		_w := 200
 	; 工具条窗：贴在对话框下边缘外侧，宽度与对话框一致，用 SWP_NOZORDER 保持 AlwaysOnTop 层位
 	DllCall("SetWindowPos", "Ptr", G_BarHwnd, "Ptr", 0, "Int", _l, "Int", _b, "Int", _w, "Int", BAR_H, "UInt", SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOSENDCHANGING, "Int")
-	; ComboBox 可见行高(CB_GETITEMHEIGHT -1)，仅用于让 ComboBox 垂直居中
-	_row_h := 22
-	if (G_ComboHwnd && DllCall("IsWindow", "Ptr", G_ComboHwnd)) {
-		_eh := DllCall("SendMessage", "Ptr", G_ComboHwnd, "UInt", 0x0154, "Ptr", -1, "Ptr", 0, "Ptr")
-		if (_eh >= 16 && _eh <= BAR_H - 4)
-			_row_h := _eh
+	; 子控件(子窗口)随父窗自动跟随移动，只有在宽度变化(缩放)时才需要重排
+	if (_w != G_BarChildW) {
+		G_BarChildW := _w
+		DllCall("SetWindowPos", "Ptr", G_ComboHwnd, "Ptr", 0, "Int", 4, "Int", G_ComboY, "Int", _w - 8 - BAR_BTN_W - BAR_GAP, "Int", G_ComboWinH, "UInt", SWP_NOZORDER | SWP_NOACTIVATE, "Int")
+		DllCall("SetWindowPos", "Ptr", G_BarBtnHwnd, "Ptr", 0, "Int", _w - 4 - BAR_BTN_W, "Int", G_BtnY, "Int", BAR_BTN_W, "Int", BAR_H - 6, "UInt", SWP_NOZORDER | SWP_NOACTIVATE, "Int")
 	}
-	; ⚙ 按钮固定高度(不被压扁)；两者各自垂直居中 => 中心轴一致即视觉对齐
-	_btn_h := BAR_H - 6
-	_cy := (BAR_H - _row_h) // 2
-	_by := (BAR_H - _btn_h) // 2
-	; ComboBox：占满左侧（只改宽度与纵向位置，高度沿用创建值，避免破坏下拉列表高度）
-	if (G_ComboHwnd && DllCall("IsWindow", "Ptr", G_ComboHwnd)) {
-		_crect := Buffer(16)
-		DllCall("GetWindowRect", "Ptr", G_ComboHwnd, "Ptr", _crect)
-		_chh := NumGet(_crect, 12, "Int") - NumGet(_crect, 4, "Int")
-		_cw := _w - 8 - BAR_BTN_W - BAR_GAP
-		DllCall("SetWindowPos", "Ptr", G_ComboHwnd, "Ptr", 0, "Int", 4, "Int", _cy, "Int", _cw, "Int", _chh, "UInt", SWP_NOZORDER | SWP_NOACTIVATE, "Int")
-	}
-	; ⚙ 按钮：右侧，固定高度，与 ComboBox 中心轴对齐
-	if (G_BarBtnHwnd && DllCall("IsWindow", "Ptr", G_BarBtnHwnd))
-		DllCall("SetWindowPos", "Ptr", G_BarBtnHwnd, "Ptr", 0, "Int", _w - 4 - BAR_BTN_W, "Int", _by, "Int", BAR_BTN_W, "Int", _btn_h, "UInt", SWP_NOZORDER | SWP_NOACTIVATE, "Int")
 }
 
-; 等待"对话框会话"结束：对话框被销毁，或对话框与工具条都不再是前台窗口。
-; 关键：把焦点落在工具条上视为会话仍在进行，否则点一下工具条就会把它自己隐藏掉。
+; 等待"对话框会话"结束。用 WinWaitNotActive（AHK 内置的前台等待，开销极低）代替 30ms 轮询；
+; 仅当焦点落在工具条上时才短暂轮询，避免因工具条持有焦点而误判会话未结束。
 WaitDialogSessionEnd(WinID) {
 	global G_BarHwnd
 	Loop {
-		if (WinActive("ahk_id " WinID)) {
-			Sleep 30
-			continue
-		}
-		; 焦点落在工具条上时视为会话仍在进行，
-		; 但需同时确认对话框还在，否则会因工具条仍在前台而永远等不到结束
-		if (G_BarHwnd && WinActive("ahk_id " G_BarHwnd) && DllCall("IsWindow", "Ptr", WinID)) {
-			Sleep 30
-			continue
-		}
-		return
+		WinWaitNotActive(WinID)
+		if (!DllCall("IsWindow", "Ptr", WinID))
+			return
+		if (!(G_BarHwnd && WinActive("ahk_id " G_BarHwnd)))
+			return
+		Sleep 30
 	}
 }
 
